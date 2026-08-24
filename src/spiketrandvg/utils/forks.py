@@ -33,7 +33,6 @@ REPOS = WS / "repositories"
 FORKS = {
     "sdt2": REPOS / "Spike-Driven-Transformer-V2",
     "spikeyolo": REPOS / "SpikeYOLO",
-    "spikelm": REPOS / "SpikeLM",
     "talk2event": REPOS / "Talk2Event",
     "sfod": REPOS / "SFOD",
     "e3dsnn": REPOS / "E-3DSNN",
@@ -117,40 +116,6 @@ def load_ilif() -> tuple[type, type]:
 def fork_status() -> dict[str, str]:
     """Report each fork's presence -- cheap handshake for sanity checks."""
     return {k: ("ok" if p.is_dir() else "MISSING") for k, p in FORKS.items()}
-
-
-@lru_cache(maxsize=1)
-def load_spikelm():
-    """SpikeLM's spiking BERT (`spike_bert.py`), loaded as `spikelm_bert`.
-
-    Contract verified against the source:
-      * `BertModel(config, add_pooling_layer=False)` takes a stock transformers
-        `BertConfig` carrying five extra attributes the spiking code reads:
-        weight_bits, quantize_act, clip_val, input_bits, T (spiking.py:99-106,
-        spike_bert.py:189).
-      * `BertEncoder` owns the time axis itself: it repeats the embeddings to
-        (T, B, L, D) at spike_bert.py:479 and averages back with `.mean(0)` at :506,
-        so `last_hidden_state` is (B, L, hidden) and its T is independent of ours.
-      * CUDA-ONLY: `SpikeLinear.forward` hard-codes `.cuda()` (spiking.py:116-117),
-        so both model and inputs must be on the GPU.
-      * Needs transformers < 5 -- it imports `find_pruneable_heads_and_indices`,
-        removed in 5.x. This project pins `transformers>=4.30,<5` for that reason.
-      * No released weights: the architecture is used with our own training.
-
-    `spike_bert.py:52` does a bare `from spiking import ...`, so spiking.py is
-    registered under the plain name `spiking` for the duration of the import and
-    then removed, keeping that generic name out of the process afterwards.
-    """
-    d = FORKS["spikelm"] / "spikeLM-BERT"
-    spiking = _load_file("spikelm_spiking", d / "spiking.py")
-    had = "spiking" in sys.modules
-    if not had:
-        sys.modules["spiking"] = spiking
-    try:
-        return _load_file("spikelm_bert", d / "spike_bert.py")
-    finally:
-        if not had:
-            sys.modules.pop("spiking", None)
 
 
 @lru_cache(maxsize=1)
@@ -380,7 +345,7 @@ def load_cmsf() -> types.SimpleNamespace:
     Loading: `CrossEncoder.py` does `from lib.CPG import ...` and
     `from lib.positional_embedding import ...`, so CMSF's `lib/` is registered under the
     generic name `lib` for the duration of the import and removed afterwards, keeping
-    that name out of the process (same trick `load_spikelm` uses for `spiking`).
+    that name out of the process.
 
     CUDA note: every neuron is constructed with `backend='cupy'`. Construction is allowed
     through with `allow_cupy_construction()` and the neurons are switched to the torch

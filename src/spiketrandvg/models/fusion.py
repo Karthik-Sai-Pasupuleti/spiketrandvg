@@ -26,7 +26,7 @@ their contribution exactly, whereas masking before the coder's LayerNorm would n
 
 Spike discipline
 ----------------
-`EventVisionEncoder` returns MEMBRANE potentials (analog), and `SpikeLMTextEncoder`
+`EventVisionEncoder` returns MEMBRANE potentials (analog), and `TextEmbedder`
 returns an analog projection. CMSF's blocks expect spike trains on both sides -- its own
 pipeline runs each modality through a spike coder first. Both sides are therefore coded
 here: text with the fork's `RepeatTextEncoder` (B,L,D -> T,B,L,D), vision with
@@ -76,7 +76,7 @@ class CrossModalFusion(nn.Module):
 
     forward(maps, text_tokens, text_mask)
         maps        {name: (T, B, C_name, H_s, W_s)}  membrane potentials from the encoder
-        text_tokens (B, L, d_model)                   from SpikeLMTextEncoder
+        text_tokens (B, L, d_model)                   from TextEmbedder
         text_mask   (B, L) 1 for real tokens          the tokenizer's attention_mask
         -> {name: (T, B, d_model, H_s, W_s)}          all scales at a common width
 

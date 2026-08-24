@@ -1,11 +1,11 @@
 """SpikeGroundingV2: frozen pretrained encoders, text-queried cross-attention, one box.
 
-    events (T,B,2,480,640)                     caption (B,L)
+    events (T,B,2,480,640)              text tokens (B, L, d_model)
             |                                       |
-    DetectionBackbone  [FROZEN]            SpikeLMTextEncoder  [FROZEN]
-    SpikeYOLO, mAP@0.5 0.5307 on            SpikeLM BERT, roberta-base init
+    DetectionBackbone  [FROZEN]            <supplied by the caller>
+    SpikeYOLO, mAP@0.5 0.5307 on           any encoder producing (B,L,d)
     Talk2Event detection
-            |  s8 / s16 taps                        |  (B,L,256) tokens
+            |  s8 / s16 taps                        |
       lateral 1x1 + learnable 2D pos                |
             |  (T,B,N_vis,256) vision tokens        |
             +-----------> TextQueryFusion <---------+
@@ -17,7 +17,16 @@
                    ONE box (B,4) normalised cxcywh
 
 Trainable: lateral projections, positional embedding, cross-attention, box head.
-Frozen: the entire vision backbone (12.7M) and the entire text encoder (124.1M).
+Frozen: the vision backbone (12.7M).
+
+The text encoder is NOT part of this model
+------------------------------------------
+`forward` takes `text_tokens` of shape (B, L, d_model) plus an `attention_mask`; producing
+them is the caller's job. The SpikeLM encoder that used to live here has been removed --
+124.3M parameters of roberta-base transplanted into a spiking BERT, never spike-pretrained,
+and with it frozen the model was measured caption-blind over 85 epochs (mean caption delta
++0.0009, against +0.051 when the encoders were allowed to move; see
+`docs/research-log.md`). Whatever replaces it only has to satisfy that one contract.
 
 Why the attention runs text->vision
 -----------------------------------
@@ -58,7 +67,6 @@ from spikingjelly.clock_driven import neuron as sj_neuron
 
 from spiketrandvg.datasets.events_voxel_cube import T_STEPS
 from spiketrandvg.models.spikeyolo_detector import DetectionBackbone
-from spiketrandvg.models.text_encoder import MAX_TEXT_LEN, SpikeLMTextEncoder
 from spiketrandvg.utils import forks
 
 __all__ = ["SpikeGroundingV2", "SpatialCrossAttention", "build_grounding_v2"]
@@ -246,9 +254,7 @@ class SpikeGroundingV2(nn.Module):
         taps: tuple[str, ...] = DEFAULT_TAPS,
         T: int = T_STEPS,
         backbone_ckpt: str | None = None,
-        text_donor: str | None = "roberta-base",
         freeze_vision: bool = True,
-        freeze_text: bool = True,
         depth: int = 2,
         num_heads: int = 8,
         mlp_ratio: float = 2.0,
@@ -262,14 +268,6 @@ class SpikeGroundingV2(nn.Module):
         self.d_model = d_model
 
         self.vision = VisionTokens(backbone_ckpt, taps, d_model, freeze=freeze_vision)
-        self.text = SpikeLMTextEncoder(d_model=d_model, freeze=freeze_text)
-        if text_donor is not None:
-            from spiketrandvg.models.text_encoder import load_pretrained_weights
-
-            self.text_report = load_pretrained_weights(self.text, donor=text_donor)
-        self.freeze_text = freeze_text
-        if freeze_text:
-            self.text.requires_grad_(False)  # frozen in full, proj included
 
         with forks.allow_cupy_construction():
             # spike coders: both sides arrive analog, CMSF's blocks expect spike trains
@@ -334,23 +332,25 @@ class SpikeGroundingV2(nn.Module):
     def level_numel(self) -> int:
         return self.vision.level.numel()
 
-    def forward(self, cube, input_ids, attention_mask) -> torch.Tensor:
+    def forward(self, cube, text_tokens, attention_mask) -> torch.Tensor:
+        """cube (T,B,2,H,W); text_tokens (B,L,d_model); attention_mask (B,L)."""
         if cube.dim() != 5 or cube.shape[0] != self.T:
             raise ValueError(f"expected (T={self.T}, B, 2, H, W), got {tuple(cube.shape)}")
-        if input_ids.shape[1] > MAX_TEXT_LEN:
-            raise ValueError(f"caption length {input_ids.shape[1]} > {MAX_TEXT_LEN}")
-        if cube.shape[1] != input_ids.shape[0]:
-            raise ValueError(f"batch mismatch {cube.shape[1]} vs {input_ids.shape[0]}")
+        if text_tokens.dim() != 3 or text_tokens.shape[-1] != self.d_model:
+            raise ValueError(f"expected (B, L, {self.d_model}) text tokens, "
+                             f"got {tuple(text_tokens.shape)}")
+        if cube.shape[1] != text_tokens.shape[0]:
+            raise ValueError(f"batch mismatch {cube.shape[1]} vs {text_tokens.shape[0]}")
+        if text_tokens.shape[1] != attention_mask.shape[1]:
+            raise ValueError(f"token/mask length mismatch {text_tokens.shape[1]} vs "
+                             f"{attention_mask.shape[1]}")
 
         self.reset()
         vis = self.vision(cube)                                   # (T,B,N,d) analog
-        tctx = torch.no_grad() if self.freeze_text else contextlib.nullcontext()
-        with tctx:
-            tokens, _ = self.text(input_ids, attention_mask)      # (B,L,d) analog
 
         # spike-code both sides
         v = self.vis_lif(self.vis_norm(vis))                      # (T,B,N,d)
-        q = self.txt_coder(tokens)                                # (T,B,L,d)
+        q = self.txt_coder(text_tokens)                           # (T,B,L,d)
         mask = attention_mask[None, :, :, None].to(q.dtype)
         q = q * mask                                              # padded queries carry nothing
 
@@ -367,7 +367,7 @@ class SpikeGroundingV2(nn.Module):
         return x.mean(0).sigmoid()                                # (B,4)
 
     @torch.no_grad()
-    def predict(self, cube, input_ids, attention_mask, amp: bool = True) -> torch.Tensor:
+    def predict(self, cube, text_tokens, attention_mask, amp: bool = True) -> torch.Tensor:
         """(B,4) xyxy in pixels.
 
         Runs under bf16 autocast by default because that is the dtype the model is
@@ -382,7 +382,7 @@ class SpikeGroundingV2(nn.Module):
                if amp and cube.is_cuda else contextlib.nullcontext())
         try:
             with ctx:
-                b = self(cube, input_ids, attention_mask)
+                b = self(cube, text_tokens, attention_mask)
             b = b.float()
         finally:
             self.train(was)

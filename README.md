@@ -55,9 +55,13 @@ error anywhere.
 exactly zero and the model silently ignores the caption. Measured; see finding 1 in the
 research log.
 
+**The text encoder is not part of the grounding model.** `SpikeGroundingV2.forward` takes
+`text_tokens` of shape (B, L, d_model); `models/text_embedder.py` is the default provider.
+SpikeLM was removed -- see section 7b of the research log.
+
 ## Caveat on notebooks
 
 `notebooks/spiketrandvg_architecture.ipynb` still holds executed outputs from an earlier
 DFL-based grounding head and does not reflect the current `SingleBoxHead`. The other
-notebooks (`e3dsnn_event_bbox`, `spikelm_text_encoder`, `visualize_events`,
-`train_cifar10_dvs`) are standalone investigations and remain accurate.
+notebooks (`e3dsnn_event_bbox`, `visualize_events`, `train_cifar10_dvs`) are standalone
+investigations and remain accurate.

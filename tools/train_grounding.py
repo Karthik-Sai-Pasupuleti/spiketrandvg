@@ -8,8 +8,8 @@ The head is `SingleBoxHead`: a spiking MLP that regresses four numbers, so the m
 emits exactly one box and the objective is a plain L1 + CIoU regression -- no anchors, no
 assignment, no classification term.
 
-`freeze_text=True` freezes SpikeLM's 124.1M-parameter BERT and holds it in eval mode.
-`SpikeLMTextEncoder.proj` (768 -> 256) stays trainable: it has no donor counterpart by
+`freeze_text=True` freezes the HuggingFace text encoder and holds it in eval mode.
+`TextEmbedder.proj` (hidden -> 256) stays trainable: it has no donor counterpart by
 construction -- it exists only to match the fusion width -- so freezing it would leave a
 random projection in the middle of the model forever. Trainable total is 74.9M: the
 vision backbone, fusion, neck, head, and that projection.
@@ -60,7 +60,7 @@ from spiketrandvg.datasets.events_voxel_cube import T_STEPS, talk2event_cube
 from spiketrandvg.datasets.talk2event_dataset import Talk2EventDataset
 from spiketrandvg.models.grounding_loss import SingleBoxLoss, cxcywh_to_xyxy_norm
 from spiketrandvg.models.grounding_model import DEFAULT_TAPS, SpikeTransDVG
-from spiketrandvg.models.text_encoder import MAX_TEXT_LEN, build_tokenizer
+from spiketrandvg.models.text_embedder import MAX_TEXT_LEN, build_tokenizer
 from spiketrandvg.utils import forks
 
 IOU_THRESHOLDS = (0.25, 0.5, 0.75, 0.9)

@@ -3,7 +3,7 @@
 Fully spiking language-driven object grounding on Talk2Event. Every component comes from a
 frozen fork under `repositories/`; nothing in those repos is edited.
 
-**Status as of 2026-08-23.** Stage-1 detection pretraining is complete and the augmented
+**Status as of 2026-08-24.** Stage-1 detection pretraining is complete and the augmented
 backbone is the best artefact produced so far. Stage-2 grounding on that backbone has not
 started and is blocked on one design decision (see [Open decisions](#open-decisions)).
 
@@ -38,8 +38,8 @@ grounding mIoU of 0.2225 is far below that — see [finding 3](#3-the-grounding-
 ```
 events (T=5, B, 2, 480, 640)                    caption (B, L)
         |                                              |
-  EventVisionEncoder                          SpikeLMTextEncoder
-  Meta-SpikeFormer (SDTv2), ImageNet init      SpikeLM BERT, roberta-base init
+  EventVisionEncoder                          TextEmbedder
+  Meta-SpikeFormer (SDTv2), ImageNet init      HuggingFace encoder + projection
         |  taps s4 / s8 / s16b                        |  (B, L, 256) tokens
         +---------------> CrossModalFusion <----------+
                           CMSF spiking cross-attention, per scale
@@ -65,7 +65,6 @@ events -> DetectionBackbone (SpikeYOLO, snn_yolov8 topology)  taps s4/s8/s16/s32
 | component | fork | loader |
 |---|---|---|
 | Meta-SpikeFormer vision encoder | `Spike-Driven-Transformer-V2` | `forks.load_metaspikformer()` |
-| SpikeLM spiking BERT | `SpikeLM` | `forks.load_spikelm()` |
 | CMSF spiking cross-attention | `CMSF` | `forks.load_cmsf()` |
 | SpikeYOLO blocks, `SpikeDetect`, `TaskAlignedAssigner`, `bbox_iou` | `SpikeYOLO` | `forks.load_spikeyolo()` |
 | E-3DSNN sparse-3D backbone (explored, not used) | `E-3DSNN` | `forks.load_e3dsnn()` |
@@ -85,7 +84,7 @@ Two loader details worth knowing:
 | file | role |
 |---|---|
 | `models/event_encoder.py` | Meta-SpikeFormer wrapper, multi-scale taps |
-| `models/text_encoder.py` | SpikeLM BERT + roberta-base transplant |
+| `models/text_embedder.py` | HuggingFace encoder + projection to fusion width |
 | `models/fusion.py` | CMSF cross-attention adapted to dense feature maps |
 | `models/grounding_model.py` | `SpikingPAN`, `SingleBoxHead`, `SpikeTransDVG` |
 | `models/grounding_loss.py` | `SingleBoxLoss` (L1 + CIoU) |
@@ -372,6 +371,31 @@ augmentation instead.
   NaN — never carry.
 
 ---
+
+## 7b. SpikeLM removed (2026-08-24)
+
+The SpikeLM text encoder was deleted: `models/text_encoder.py`, `forks.load_spikelm()`,
+and `notebooks/spikelm_text_encoder.ipynb`. `models/text_embedder.py` replaces it with a
+stock HuggingFace encoder plus a projection, and **the text encoder is no longer part of
+the grounding model** -- `SpikeGroundingV2.forward` takes `text_tokens` of shape
+(B, L, d_model) and the caller supplies them.
+
+Why: SpikeLM was 124.3M parameters of roberta-base transplanted by name into a spiking
+BERT (197/199 tensors). SpikeLM ships no weights, so nothing about it was spike-pretrained.
+Two runs of the same architecture differing only in the freeze flags settled it:
+
+| encoders | epochs | caption delta |
+|---|---|---|
+| frozen | 85 | +0.0009 |
+| unfrozen | 2 | **+0.051** |
+
+A caption-blind model at delta +0.0009 against mIoU 0.21 means a deliberately wrong caption
+costs 0.4% of the prediction. The fusion and head were not the blocker; the encoders were.
+
+Also refuted this session: the hypothesis that event cameras cannot see what the captions
+describe. Over 4,929 same-frame caption pairs, **97.0%** differ by a position word, 58.6%
+by a motion word, **99.4%** by some event-observable cue, and only **0.4%** by colour
+alone. The discriminating information is in the events.
 
 ## 8. Open decisions
 

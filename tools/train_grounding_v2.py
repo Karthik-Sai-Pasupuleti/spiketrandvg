@@ -1,10 +1,15 @@
-"""Stage 2: train SpikeGroundingV2 -- frozen encoders, text-queried cross-attention.
+"""Stage 2: train SpikeGroundingV2 -- text-queried cross-attention over a frozen backbone.
 
     uv run python tools/train_grounding_v2.py --run-name ground_v2 --epochs 20
 
-Trainable: lateral projections, positional embedding, cross-attention, box head (4.02M).
-Frozen: the SpikeYOLO detection backbone (12.6M, mAP@0.5 0.5307) and the SpikeLM text
-encoder (124.3M).
+Trainable: lateral projections, positional embedding, cross-attention, box head (4.02M),
+plus the text projection. Frozen by default: the SpikeYOLO detection backbone (12.6M,
+mAP@0.5 0.5307) and the HuggingFace text encoder chosen with `--text-model`.
+
+The text encoder is a separate module (`models/text_embedder.py`), not part of the
+grounding model. SpikeLM was removed: 124.3M parameters of roberta-base transplanted into
+a spiking BERT, never spike-pretrained, and frozen it left the model caption-blind over 85
+epochs (mean delta +0.0009).
 
 Two things this script does that the earlier grounding trainer did not
 ----------------------------------------------------------------------
@@ -41,7 +46,7 @@ from spiketrandvg.datasets.events_voxel_cube import T_STEPS, talk2event_cube
 from spiketrandvg.datasets.talk2event_dataset import Talk2EventDataset
 from spiketrandvg.models.grounding_loss import SingleBoxLoss, cxcywh_to_xyxy_norm
 from spiketrandvg.models.grounding_v2 import SpikeGroundingV2
-from spiketrandvg.models.text_encoder import MAX_TEXT_LEN, build_tokenizer
+from spiketrandvg.models.text_embedder import MAX_TEXT_LEN, TextEmbedder, build_tokenizer
 
 IOU_THRESHOLDS = (0.25, 0.5, 0.75, 0.9)
 
@@ -71,10 +76,10 @@ def make_collate(tokenizer):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, amp_ctx, tokenizer, blind: bool = False):
+def evaluate(model, text, loader, device, amp_ctx, tokenizer, blind: bool = False):
     """mIoU and Acc@thresholds. With `blind`, captions are shuffled across the batch --
     the model sees the right events with the wrong words."""
-    model.eval()
+    model.eval(); text.eval()
     ious = []
     for cube, ids, mask, gt, caps in loader:
         if blind:
@@ -86,7 +91,7 @@ def evaluate(model, loader, device, amp_ctx, tokenizer, blind: bool = False):
             ids, mask = tok["input_ids"], tok["attention_mask"]
         cube, ids, mask, gt = (t.to(device, non_blocking=True) for t in (cube, ids, mask, gt))
         with amp_ctx():
-            pred = model(cube, ids, mask)
+            pred = model(cube, text(ids, mask), mask)
         p, g = cxcywh_to_xyxy_norm(pred.float()), cxcywh_to_xyxy_norm(gt)
         ious += box_iou(p, g).diagonal().tolist()
     t = torch.tensor(ious)
@@ -112,8 +117,10 @@ def main() -> None:
     ap.add_argument("--backbone-ckpt", default="runs/det_aug/backbone.pth")
     ap.add_argument("--freeze-vision", action="store_true",
                     help="hold the detection-pretrained backbone fixed")
+    ap.add_argument("--text-model", default="roberta-base",
+                    help="HuggingFace encoder that produces the caption tokens")
     ap.add_argument("--freeze-text", action="store_true",
-                    help="hold the SpikeLM text encoder fixed")
+                    help="hold the text encoder fixed")
     ap.add_argument("--encoder-lr", type=float, default=1e-5,
                     help="LR for the PRETRAINED encoders; the from-scratch modules use --lr")
     ap.add_argument("--taps", nargs="+", default=["s8", "s16"])
@@ -144,19 +151,23 @@ def main() -> None:
     test_dl = DataLoader(eval_src, batch_size=args.batch_size, shuffle=False,
                          num_workers=args.workers, collate_fn=collate, pin_memory=True)
 
+    # The text encoder now lives OUTSIDE the grounding model: it produces (B, L, d_model)
+    # tokens and the model consumes them. Swapping encoders is a one-flag change.
+    text = TextEmbedder(args.text_model, d_model=256, freeze=args.freeze_text).to(device)
     model = SpikeGroundingV2(
         taps=tuple(args.taps), T=T_STEPS, backbone_ckpt=args.backbone_ckpt,
         depth=args.depth, attn_type=args.attn_type,
-        freeze_vision=args.freeze_vision, freeze_text=args.freeze_text,
+        freeze_vision=args.freeze_vision,
     ).to(device)
     crit = SingleBoxLoss().to(device)
-    params = [p for p in model.parameters() if p.requires_grad]
+    params = [p for p in model.parameters() if p.requires_grad] + \
+             [p for p in text.parameters() if p.requires_grad]
 
     # Pretrained encoders get a much smaller LR than the from-scratch fusion and head.
     # At a shared 5e-4 the 124M-parameter text encoder would overwrite roberta-base's
     # language knowledge long before the 1.3M-parameter fusion learns to use it.
     enc_ids = {id(p) for p in
-               list(model.vision.backbone.parameters()) + list(model.text.parameters())}
+               list(model.vision.backbone.parameters()) + list(text.encoder.parameters())}
     enc = [p for p in params if id(p) in enc_ids]
     new = [p for p in params if id(p) not in enc_ids]
     groups = [g for g in ({"params": enc, "lr": args.encoder_lr},
@@ -177,7 +188,7 @@ def main() -> None:
             g["lr"] = b * f
         return f
 
-    tot = sum(p.numel() for p in model.parameters())
+    tot = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in text.parameters())
     tr = sum(p.numel() for p in params)
     print(f"device {device} | bf16 everywhere (train AND eval) | batch {args.batch_size} "
           f"x accum {args.accum}")
@@ -205,14 +216,14 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         if stop:
             break
-        model.train()
+        model.train(); text.train()
         run = {"loss": 0.0, "l1": 0.0, "ciou": 0.0, "iou": 0.0, "n": 0}
         opt.zero_grad(set_to_none=True)
         for cube, ids, mask, gt, _caps in train_dl:
             cube, ids, mask, gt = (t.to(device, non_blocking=True)
                                    for t in (cube, ids, mask, gt))
             with amp_ctx():
-                pred = model(cube, ids, mask)
+                pred = model(cube, text(ids, mask), mask)
             loss, parts = crit(pred.float(), gt)
             (loss / args.accum).backward()
             run["loss"] += loss.item(); run["n"] += 1
@@ -234,10 +245,10 @@ def main() -> None:
                 break
 
         n = max(1, run["n"])
-        m = evaluate(model, test_dl, device, amp_ctx, tokenizer)
-        blind = (evaluate(model, test_dl, device, amp_ctx, tokenizer, blind=True)
+        m = evaluate(model, text, test_dl, device, amp_ctx, tokenizer)
+        blind = (evaluate(model, text, test_dl, device, amp_ctx, tokenizer, blind=True)
                  if args.blind_every and epoch % args.blind_every == 0 else None)
-        model.train()
+        model.train(); text.train()
         delta = (m["mIoU"] - blind["mIoU"]) if blind else float("nan")
 
         print(f"EPOCH {epoch:3d} | loss {run['loss']/n:6.3f} (l1 {run['l1']/n:.4f} "
@@ -254,7 +265,8 @@ def main() -> None:
                      + f"\t{blind['mIoU'] if blind else float('nan'):.4f}\t{delta:.4f}"
                      + f"\t{int(time.time()-t0)}\n")
 
-        blob = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch,
+        blob = {"model": model.state_dict(), "text": text.state_dict(),
+                "opt": opt.state_dict(), "epoch": epoch,
                 "best": best, "args": vars(args), "metrics": m}
         torch.save(blob, out / "last.pth")
         if m["mIoU"] > best:
@@ -271,8 +283,8 @@ def main() -> None:
     print(f"\nfinal full-split evaluation ({len(test_ds)} samples)", flush=True)
     full_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                          num_workers=args.workers, collate_fn=collate, pin_memory=True)
-    m = evaluate(model, full_dl, device, amp_ctx, tokenizer)
-    b = evaluate(model, full_dl, device, amp_ctx, tokenizer, blind=True)
+    m = evaluate(model, text, full_dl, device, amp_ctx, tokenizer)
+    b = evaluate(model, text, full_dl, device, amp_ctx, tokenizer, blind=True)
     m["blind_mIoU"], m["caption_delta"] = b["mIoU"], m["mIoU"] - b["mIoU"]
     print("  " + "  ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}"
                            for k, v in m.items()), flush=True)

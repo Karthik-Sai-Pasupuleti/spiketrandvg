@@ -2,8 +2,8 @@
 
     events  (T, B, 2, H, W)          caption (B, L) token ids + mask
         |                                     |
-    EventVisionEncoder                 SpikeLMTextEncoder
-    (Meta-SpikeFormer, SDTv2)          (SpikeLM BERT, roberta-base init)
+    EventVisionEncoder                 TextEmbedder
+    (Meta-SpikeFormer, SDTv2)          (HuggingFace encoder + projection)
         |  {s4, s8, s16b} membranes           |  (B, L, d) tokens
         +---------------> CrossModalFusion <--+
                           (CMSF spiking cross-attention, per scale)
@@ -42,10 +42,9 @@ caption must shape the features themselves.
 Timing and state
 ----------------
 The vision encoder's T (default `T_STEPS = 5`) flows through fusion, neck and head. The
-text encoder's own SpikeLM T is independent (4) and is averaged away inside SpikeLM, so a
-caption yields one static representation reused at every vision timestep -- correct, the
-expression does not change over the event window. The head averages its four outputs over
-T, so the prediction is per-frame, not per-timestep.
+text encoder has no time axis: a caption yields one static representation reused at every
+vision timestep -- correct, the expression does not change over the event window. The head
+averages its four outputs over T, so the prediction is per-frame, not per-timestep.
 
 Every LIF holds membrane state across calls; `forward` resets all three stages first.
 """
@@ -61,7 +60,7 @@ from spikingjelly.clock_driven import neuron as sj_neuron
 from spiketrandvg.datasets.events_voxel_cube import T_STEPS
 from spiketrandvg.models.event_encoder import TAPS, EventVisionEncoder
 from spiketrandvg.models.fusion import CrossModalFusion
-from spiketrandvg.models.text_encoder import MAX_TEXT_LEN, SpikeLMTextEncoder
+from spiketrandvg.models.text_embedder import MAX_TEXT_LEN, TextEmbedder
 from spiketrandvg.utils import forks
 
 __all__ = ["SpikingPAN", "SingleBoxHead", "SpikeTransDVG", "build_spiketrandvg",
@@ -347,13 +346,8 @@ class SpikeTransDVG(nn.Module):
             freeze=freeze_vision,
             trainable_from=vision_trainable_from,
         )
-        self.text = SpikeLMTextEncoder(
-            d_model=d_model, num_hidden_layers=text_layers, freeze=freeze_text
-        )
-        if text_donor is not None:
-            from spiketrandvg.models.text_encoder import load_pretrained_weights
-
-            self.text_report = load_pretrained_weights(self.text, donor=text_donor)
+        self.text = TextEmbedder(text_donor or "roberta-base", d_model=d_model,
+                                 freeze=freeze_text)
 
         self.fusion = CrossModalFusion(
             in_channels=self.vision.out_channels,
@@ -453,7 +447,9 @@ class SpikeTransDVG(nn.Module):
 
         self.reset()
         maps = self.vision(cube)                                  # {tap: (T,B,C,H,W)}
-        tokens, sentence = self.text(input_ids, attention_mask)   # (B,L,d), (B,d)
+        tokens = self.text(input_ids, attention_mask)             # (B, L, d)
+        _m = attention_mask.unsqueeze(-1).to(tokens.dtype)
+        sentence = (tokens * _m).sum(1) / _m.sum(1).clamp(min=1.0)  # (B, d), masked mean
         fused = self.fusion(maps, tokens, attention_mask)
         feats = self.neck([fused[t] for t in self.taps])
         return self.head(feats, sentence)            # (B, 4) normalised cxcywh
