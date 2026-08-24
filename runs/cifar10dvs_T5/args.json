@@ -1,0 +1,14 @@
+{
+ "epochs": 30,
+ "batch_size": 16,
+ "lr": 0.0001,
+ "weight_decay": 0.0001,
+ "T": 5,
+ "workers": 8,
+ "tap": "s16b",
+ "ckpt": "ckpts/spikeformer_v2_weights/55M_kd_T4.pth",
+ "trainable_from": null,
+ "freeze_backbone": false,
+ "run_name": "cifar10dvs_T5",
+ "max_iters": null
+}

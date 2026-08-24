@@ -1,0 +1,34 @@
+{
+ "run_name": "grounding_t5",
+ "epochs": 2,
+ "max_iters": null,
+ "batch_size": 1,
+ "accum": 8,
+ "lr": 0.0003,
+ "backbone_lr": 3e-05,
+ "weight_decay": 0.0001,
+ "warmup": 300,
+ "clip": 10.0,
+ "bn_momentum": 0.03,
+ "precision": "bf16",
+ "workers": 6,
+ "head_grid": [
+  6,
+  8
+ ],
+ "head_hidden": 512,
+ "l1_weight": 5.0,
+ "ciou_weight": 2.0,
+ "taps": [
+  "s4",
+  "s8",
+  "s16b"
+ ],
+ "fuse_scales": null,
+ "attn_bn_gain": 3.0,
+ "ckpt": "ckpts/spikeformer_v2_weights/55M_kd.pth",
+ "eval_every": 250,
+ "eval_samples": 600,
+ "log_every": 25,
+ "resume": null
+}

@@ -1,0 +1,22 @@
+{
+ "run_name": "det_t5_long",
+ "epochs": 300,
+ "max_iters": null,
+ "batch_size": 4,
+ "accum": 2,
+ "lr": 0.001,
+ "weight_decay": 0.0005,
+ "warmup": 300,
+ "clip": 10.0,
+ "width": 0.5,
+ "topk": 10,
+ "precision": "bf16",
+ "workers": 6,
+ "eval_every": 1,
+ "eval_frames": 300,
+ "patience": 40,
+ "train_eval_every": 1,
+ "train_eval_frames": 150,
+ "log_every": 200,
+ "resume": null
+}

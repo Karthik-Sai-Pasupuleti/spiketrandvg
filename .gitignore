@@ -1,0 +1,7 @@
+# checkpoints and run artefacts: large binaries, regenerable from the training scripts
+runs/**/*.pth
+ckpts/
+*.log
+.venv/
+__pycache__/
+*.pyc
