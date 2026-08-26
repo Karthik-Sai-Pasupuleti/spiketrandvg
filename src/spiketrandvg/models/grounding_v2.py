@@ -132,8 +132,15 @@ class SpatialCrossAttention(nn.Module):
         y = bn(y.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, L, D)
         return lif(y)
 
-    def forward(self, query, key, value, key_mask=None):
-        """query (T,B,Lq,D) text; key/value (T,B,N,D) vision; key_mask (B,N) or None."""
+    def forward(self, query, key, value, key_mask=None, return_attn: bool = False):
+        """query (T,B,Lq,D) text; key/value (T,B,N,D) vision; key_mask (B,N) or None.
+
+        `return_attn=True` additionally returns the post-softmax weights (T,B,h,Lq,N) --
+        the one tensor in this block that still carries the spatial index before the
+        output is binarised by `proj_lif`. See `RefCOCOGrounding`'s `attn_softargmax`
+        head, which reads a box centre off exactly this tensor rather than off the
+        binarised residual stream.
+        """
         T, B, Lq, D = query.shape
         N = key.shape[2]
         q = self._spike_proj(query, self.q_linear, self.q_bn, self.q_lif)
@@ -153,7 +160,8 @@ class SpatialCrossAttention(nn.Module):
 
         out = self.proj(out.flatten(0, 1))
         out = self.proj_bn(out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, Lq, D)
-        return self.proj_lif(out)
+        out = self.proj_lif(out)
+        return (out, attn) if return_attn else out
 
 
 class SpatialBlock(nn.Module):
@@ -167,7 +175,11 @@ class SpatialBlock(nn.Module):
             self.mlp = cmsf.Spiking_GFNN(dim=dim, hidden_dim=int(dim * mlp_ratio))
         forks.use_torch_backend(self)
 
-    def forward(self, x, y, key_mask=None):
+    def forward(self, x, y, key_mask=None, return_attn: bool = False):
+        if return_attn:
+            a, attn = self.attn(x, y, y, key_mask, return_attn=True)
+            x = x + a
+            return x + self.mlp(x), attn
         x = x + self.attn(x, y, y, key_mask)
         return x + self.mlp(x)
 
@@ -285,6 +297,7 @@ class RgbTokens(nn.Module):
         T_model: int = 1,
         max_hw: tuple[int, int] = (30, 40),
         freeze: bool = False,
+        pos_std: float = 0.02,
     ):
         super().__init__()
         sl = forks.load_spiliformer()
@@ -308,8 +321,15 @@ class RgbTokens(nn.Module):
 
         self.lateral = nn.Conv2d(768, d_model, kernel_size=1)
         self.pos = nn.Parameter(torch.zeros(1, d_model, *max_hw))
-        nn.init.trunc_normal_(self.pos, std=0.02)
+        nn.init.trunc_normal_(self.pos, std=pos_std)
         self.d_model = d_model
+        # RMS of the pre-position lateral output, refreshed every forward call. Compared
+        # against `self.pos`'s own RMS this is the direct test of whether `pos` survives
+        # the LIF threshold it is added before: at pos_std=0.02 against features of order
+        # 1, pos starts at ~2% of the pre-norm magnitude and a binarising LIF can discard
+        # that outright. See `tools/diagnose.py` and item 4 of the coordinate-precision
+        # study in docs/research-log.md.
+        self.last_lateral_rms: float | None = None
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -331,6 +351,7 @@ class RgbTokens(nn.Module):
 
         B, C, H, W = feats.shape
         y = self.lateral(feats)
+        self.last_lateral_rms = y.detach().float().pow(2).mean().sqrt().item()
         pos = self.pos
         if pos.shape[-2:] != (H, W):
             pos = nn.functional.interpolate(pos, size=(H, W), mode="bilinear",
