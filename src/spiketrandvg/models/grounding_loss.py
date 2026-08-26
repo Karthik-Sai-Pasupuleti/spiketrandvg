@@ -36,12 +36,25 @@ def cxcywh_to_xyxy_norm(box: torch.Tensor) -> torch.Tensor:
 
 
 class SingleBoxLoss(nn.Module):
-    """forward(pred, target) -> (total, parts), both (B, 4) normalised cxcywh."""
+    """forward(pred, target) -> (total, parts), both (B, 4) normalised cxcywh.
 
-    def __init__(self, l1_weight: float = 5.0, ciou_weight: float = 2.0):
+    Args:
+        center_weight: multiplies the L1 term on cx, cy only (w, h stay at weight 1.0).
+            Default 1.0 is the original, unweighted loss. This is a hypothesis, not an
+            established fix: an oracle swap on a separate run found essentially all
+            error attributable to centre placement (true centre + predicted size ->
+            mIoU 0.4814; predicted centre + true size -> only 0.2407), which suggests
+            the loss might usefully spend more of its gradient on cx/cy -- but that has
+            not been tested, and CIoU's centre-distance term is left unweighted here
+            since it is not separable by coordinate the way L1 is.
+    """
+
+    def __init__(self, l1_weight: float = 5.0, ciou_weight: float = 2.0,
+                 center_weight: float = 1.0):
         super().__init__()
         self.l1_weight = l1_weight
         self.ciou_weight = ciou_weight
+        self.center_weight = center_weight
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -51,7 +64,13 @@ class SingleBoxLoss(nn.Module):
                 f"expected matching (B, 4) boxes, got {tuple(pred.shape)} and "
                 f"{tuple(target.shape)}"
             )
-        l1 = F.l1_loss(pred, target)
+        diff = (pred - target).abs()
+        l1 = diff.mean()                      # reported unweighted, for cross-run comparability
+        if self.center_weight != 1.0:
+            w = diff.new_tensor([self.center_weight, self.center_weight, 1.0, 1.0])
+            l1_train = (diff * w).mean()
+        else:
+            l1_train = l1
 
         p_xyxy = cxcywh_to_xyxy_norm(pred)
         t_xyxy = cxcywh_to_xyxy_norm(target)
@@ -60,5 +79,5 @@ class SingleBoxLoss(nn.Module):
         with torch.no_grad():
             iou = box_iou(p_xyxy, t_xyxy).diagonal().mean()
 
-        total = self.l1_weight * l1 + self.ciou_weight * ciou
+        total = self.l1_weight * l1_train + self.ciou_weight * ciou
         return total, {"l1": l1.detach(), "ciou": ciou.detach(), "iou": iou}
