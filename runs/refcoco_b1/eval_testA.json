@@ -1,0 +1,15 @@
+{
+ "n": 5657,
+ "mIoU": 0.40754643082618713,
+ "Acc@0.25": 0.7115078568458557,
+ "Acc@0.5": 0.38907548785209656,
+ "Acc@0.75": 0.08520416915416718,
+ "Acc@0.9": 0.006187024991959333,
+ "blind_mIoU": 0.16743390262126923,
+ "mIoU_on_hard_subset": 0.40598005056381226,
+ "caption_delta": 0.23854614794254303,
+ "n_hard": 5564,
+ "_delta_note": "negatives are a caption for a DIFFERENT object in the SAME image; delta compares only the n_hard samples that have one",
+ "_split": "refcoco/testA",
+ "_ckpt": "runs/refcoco_b1/best.pth"
+}

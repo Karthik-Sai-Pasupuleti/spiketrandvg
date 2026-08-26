@@ -25,9 +25,9 @@ from pathlib import Path
 import torch
 from spikingjelly.clock_driven import neuron as sj_neuron
 
-# This file sits at <ws>/spiketrandvg/src/spiketrandvg/utils/forks.py, so the
+# This file sits at <ws>/spiketrandvg/src/spiketrandvg/forks.py, so the
 # workspace root (the parent of this repo, holding repositories/) is 5 levels up.
-WS = Path(os.environ.get("T2E_WS", Path(__file__).resolve().parents[4]))
+WS = Path(os.environ.get("T2E_WS", Path(__file__).resolve().parents[3]))
 REPOS = WS / "repositories"
 
 FORKS = {

@@ -84,7 +84,7 @@ __all__ = [
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-_WS = Path(os.environ.get("T2E_WS", Path(__file__).resolve().parents[4]))
+_WS = Path(os.environ.get("T2E_WS", Path(__file__).resolve().parents[3]))
 DATA_ROOT = Path(os.environ.get("REFCOCO_ROOT", _WS / "dataset" / "refcoco"))
 
 # (dataset, split) -> annotation file stem. refcocog has no testA/testB -- it is the umd

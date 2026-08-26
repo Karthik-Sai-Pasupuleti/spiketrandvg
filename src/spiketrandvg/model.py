@@ -2,11 +2,11 @@
 
     rgb (B,3,H,W)                          input_ids / attention_mask (B,L)
           |                                              |
-    SpiLiFormer (SNN)                          roberta-base (ANN, frozen)
-    ICCV 2025, ImageNet 85.82% @ T=4           124.6M + a trainable 0.2M projection
-          | /16                                          |
+    VisionEncoder (SNN)                        TextEncoder (ANN, frozen)
+    SpiLiFormer, ImageNet 85.82% @ T=4         roberta-base + 0.2M projection
+          | /16 -> 24x24 = 576 tokens                    |
     lateral 1x1 + learnable 2D pos                       |
-          |  (T,B,N_vis,256)                             |  (B,L,256)
+          |  (T,B,576,256)                               |  (B,L,256)
           |                                     RepeatTextEncoder -> (T,B,L,256)
           +------------> SpatialBlock x depth <----------+
                  softmax cross-attention, Q = TEXT, K = V = VISION
@@ -15,110 +15,249 @@
                               |
                        ONE box (B,4) normalised cxcywh
 
-This is `SpikeGroundingV2` with the event branch removed and the text encoder brought
-inside. Everything else is the same object: `RgbTokens`, `SpatialBlock` and the box head
-are imported from `models/grounding_v2.py` rather than reimplemented, so a finding about
-the fusion or the head applies to both models and there is one place to fix it.
+One box, train and eval alike -- no anchors, no scores, no argmax, so nothing to threshold
+or NMS at inference.
 
-Why a separate class instead of a flag on SpikeGroundingV2
-----------------------------------------------------------
-`SpikeGroundingV2.forward` requires an event cube and validates its shape against T_STEPS.
-Making that optional would put a second, RGB-only code path through a class whose whole
-purpose is the two-stream comparison, and every event-stream invariant would have to grow
-an "unless RGB-only" clause. RefCOCO has no events, and hybrid experiments are still the
-Talk2Event baseline, so the two stay separate and share components.
+Why the attention runs text->vision
+-----------------------------------
+Querying with vision and attending over text would produce 576 query tokens and a head
+that has to pool them back down. Querying with TEXT makes the output sequence the caption
+itself -- typically 5-10 real tokens -- so the box is read from a language-shaped
+representation that has absorbed visual context, and softmax attention becomes affordable
+in the process.
 
-The text encoder IS part of this model
---------------------------------------
-Unlike `SpikeGroundingV2`, which takes `(B, L, d_model)` tokens and leaves their
-production to the caller, this model owns its `TextEmbedder`. On Talk2Event the encoder
-was a moving research variable -- SpikeLM, then roberta, frozen or not -- and keeping it
-outside made swapping it a one-line change. Here it is fixed: RefCOCO is a standard
-benchmark and the point is to measure the fusion, not to re-litigate the encoder. Owning
-it means `forward(rgb, input_ids, attention_mask)` is the whole contract.
+Why softmax and not CMSF's linear attention
+-------------------------------------------
+`cmsf_linear` forms `k^T v` and thereby SUMS OVER EVERY KEY POSITION: the spatial index is
+marginalised away and no text query can ask *where* something is. `spatial_softmax`
+(default) keeps one weight per vision position, which is exactly the "which location does
+this phrase refer to" operation grounding needs. Do not switch to `cmsf_linear` expecting
+localisation.
 
-What T means with no event stream
----------------------------------
-On Talk2Event, T came from the event window: 5 voxel bins, a real temporal axis. A still
-image has none, so T here is purely the spiking simulation length. It still matters --
-LIF membranes integrate across timesteps, so T=1 degenerates every neuron into a plain
-threshold and discards the dynamics that make this an SNN. Default 4, matching the T the
-SpiLiFormer checkpoint was pretrained at. Cost is linear in T.
+Measured state of this architecture
+-----------------------------------
+On RefCOCO, trained on the full 120,624-sample train split (`runs/refcoco_b1`), evaluated
+once on the untouched test splits:
 
-Two traps carried over from the Talk2Event work, both measured
---------------------------------------------------------------
-**Positional embedding on the vision tokens is load-bearing** under `cmsf_linear`
-attention, which forms `k^T v` and sums over every key position -- the spatial index is
-marginalised away and no text query can ask *where*. `spatial_softmax` (the default) keeps
-one weight per position and does not have this problem, which is why it is the default.
+    testA  mIoU 0.4075   Acc@0.25 71.2%   Acc@0.5 38.9%   Acc@0.75 8.5%
+    testB  mIoU 0.3889   Acc@0.25 70.2%   Acc@0.5 33.5%   Acc@0.75 6.3%
+    caption_delta +0.26  (against same-image different-object negatives)
 
+It generalises -- val and test agree closely -- and it genuinely reads the caption. What
+it does NOT do is localise precisely, and `tools/diagnose.py` traced that to the fusion's
+attention map being statistically uniform (perplexity 575.8-576.0 of a 576-key maximum)
+even after 199 epochs of dedicated overfitting. See `vision_encoder.py` on the positional
+signal, which is the leading candidate mechanism. Acc@0.75 is the metric to watch for any
+fix aimed at this.
+
+Two traps, both measured
+------------------------
 **These layers are not dtype-agnostic.** Precision changes which membranes cross
 threshold, so evaluating a bf16-trained model in fp32 is a different function: measured
 0.656 IoU vs 0.060 on identical weights. `predict` autocasts to bf16 for that reason;
 train under the same dtype.
 
-head_norm0
-----------
-`head_lif1` is fed `pooled` raw, unlike `head_lif2` which sits after `head_norm`. An
-unnormalised LIF's threshold sits at whatever scale the fusion stack happens to produce,
-which drifts with depth and firing rate. Research-log finding 2 measured exactly this
-failure mode elsewhere in this codebase: head normaliser choice moved eval IoU between
-0.000 and 0.71-0.84 on an identical 8-sample fit. `head_norm0` closes that gap and is
-applied unconditionally -- it is not one of the `head_type` variants below.
+**`head_norm0` is load-bearing.** `head_lif1` used to be fed `pooled` raw while
+`head_lif2` sat after a LayerNorm, so the first neuron's threshold floated with whatever
+scale the fusion happened to produce. Head-normaliser choice was separately measured to
+move eval IoU between 0.000 and 0.71-0.84 on an identical 8-sample fit.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from spikingjelly.clock_driven import neuron as sj_neuron
+from torchvision.ops import box_iou, complete_box_iou_loss
 
-from spiketrandvg.models.grounding_v2 import RgbTokens, SpatialBlock
-from spiketrandvg.models.text_embedder import TextEmbedder
-from spiketrandvg.utils import forks
+from spiketrandvg import forks
+from spiketrandvg.text_encoder import TextEncoder
+from spiketrandvg.vision_encoder import VisionEncoder
 
-__all__ = ["RefCOCOGrounding", "build_model"]
+__all__ = ["RefCOCOGrounding", "SpatialCrossAttention", "SpatialBlock", "SingleBoxLoss",
+           "cxcywh_to_xyxy_norm", "build_model"]
 
 
+# ---------------------------------------------------------------------------- loss
+def cxcywh_to_xyxy_norm(box: torch.Tensor) -> torch.Tensor:
+    """(N, 4) normalised cxcywh -> (N, 4) normalised xyxy."""
+    cx, cy, w, h = box.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+
+
+class SingleBoxLoss(nn.Module):
+    """L = l1_weight * L1 + ciou_weight * (1 - CIoU), the DETR / TransVG single-box objective.
+
+    Both terms are needed and they fail in opposite directions. L1 on normalised cxcywh
+    has a stable gradient everywhere, including when the boxes do not overlap at all --
+    the entire early-training regime, where IoU is 0 and its gradient carries no
+    direction. CIoU matches the metric and, unlike plain IoU, keeps pulling on centre
+    distance and aspect ratio once the boxes do overlap. DETR's 5:2 weighting is the
+    default for the same reason it is there: L1 on numbers in (0, 1) is small next to an
+    IoU term that starts near 1.
+
+    Args:
+        center_weight: multiplies the L1 term on cx, cy only (w, h stay at 1.0). Default
+            1.0 is the original, unweighted loss. Hypothesis, not an established fix: an
+            oracle swap on a separate run attributed nearly all error to centre placement
+            (true centre + predicted size -> mIoU 0.4814; predicted centre + true size ->
+            only 0.2407). CIoU's own centre-distance term is left unweighted, since it is
+            not separable by coordinate the way L1 is.
+    """
+
+    def __init__(self, l1_weight: float = 5.0, ciou_weight: float = 2.0,
+                 center_weight: float = 1.0):
+        super().__init__()
+        self.l1_weight = l1_weight
+        self.ciou_weight = ciou_weight
+        self.center_weight = center_weight
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+        if pred.shape != target.shape or pred.shape[-1] != 4:
+            raise ValueError(f"expected matching (B, 4) boxes, got {tuple(pred.shape)} "
+                             f"and {tuple(target.shape)}")
+        diff = (pred - target).abs()
+        l1 = diff.mean()                  # reported unweighted, for cross-run comparability
+        if self.center_weight != 1.0:
+            w = diff.new_tensor([self.center_weight, self.center_weight, 1.0, 1.0])
+            l1_train = (diff * w).mean()
+        else:
+            l1_train = l1
+
+        p_xyxy = cxcywh_to_xyxy_norm(pred)
+        t_xyxy = cxcywh_to_xyxy_norm(target)
+        ciou = complete_box_iou_loss(p_xyxy, t_xyxy, reduction="mean")
+        with torch.no_grad():
+            iou = box_iou(p_xyxy, t_xyxy).diagonal().mean()
+
+        total = self.l1_weight * l1_train + self.ciou_weight * ciou
+        return total, {"l1": l1.detach(), "ciou": ciou.detach(), "iou": iou}
+
+
+# ------------------------------------------------------------------------- attention
+class SpatialCrossAttention(nn.Module):
+    """Softmax cross-attention over the spatial axis. Q = text, K = V = vision.
+
+    Cost is O(L_q * N_kv), which is why CMSF avoids it in general -- but here the queries
+    are the CAPTION, so a handful of tokens against 576 vision positions is nothing.
+    Reversing the attention direction is what makes softmax affordable.
+
+    Spike discipline: q/k/v projections are BN + LIF exactly as in CMSF, so those matmuls
+    are spike-driven. The attention product itself is analog -- the honest cost of being
+    able to localise, and it is one matmul, not the bulk of the compute.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, attn_drop: float = 0.0):
+        super().__init__()
+        if dim % num_heads:
+            raise ValueError(f"dim {dim} not divisible by num_heads {num_heads}")
+        cmsf = forks.load_cmsf()
+        self.h = num_heads
+        self.dh = dim // num_heads
+        self.scale = self.dh ** -0.5
+
+        self.q_linear, self.k_linear, self.v_linear = (nn.Linear(dim, dim) for _ in range(3))
+        self.q_bn, self.k_bn, self.v_bn = (nn.BatchNorm1d(dim) for _ in range(3))
+        with forks.allow_cupy_construction():
+            self.q_lif, self.k_lif, self.v_lif = (
+                cmsf.Dynamic_Threshold_LIFNode(tau=2.0, detach_reset=True, backend="cupy")
+                for _ in range(3))
+            self.proj_lif = cmsf.Dynamic_Threshold_LIFNode(
+                tau=2.0, detach_reset=True, backend="cupy")
+        forks.use_torch_backend(self)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_bn = nn.BatchNorm1d(dim)
+        self.attn_drop = nn.Dropout(attn_drop) if attn_drop > 0 else nn.Identity()
+
+    def _spike_proj(self, x, lin, bn, lif):
+        """(T,B,L,D) -> (T,B,L,D) through Linear + BN + LIF, CMSF's ordering."""
+        T, B, L, D = x.shape
+        y = lin(x.flatten(0, 1))
+        y = bn(y.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, L, D)
+        return lif(y)
+
+    def forward(self, query, key, value, key_mask=None, return_attn: bool = False):
+        """query (T,B,Lq,D) text; key/value (T,B,N,D) vision; key_mask (B,N) or None.
+
+        `return_attn=True` additionally returns the post-softmax weights (T,B,h,Lq,N) --
+        the one tensor here that still carries the spatial index before `proj_lif`
+        binarises the output. Consumed by the `attn_softargmax` head and by
+        `tools/diagnose.py`'s perplexity measurement.
+        """
+        T, B, Lq, D = query.shape
+        N = key.shape[2]
+        q = self._spike_proj(query, self.q_linear, self.q_bn, self.q_lif)
+        k = self._spike_proj(key, self.k_linear, self.k_bn, self.k_lif)
+        v = self._spike_proj(value, self.v_linear, self.v_bn, self.v_lif)
+
+        q = q.reshape(T, B, Lq, self.h, self.dh).permute(0, 1, 3, 2, 4)   # (T,B,h,Lq,dh)
+        k = k.reshape(T, B, N, self.h, self.dh).permute(0, 1, 3, 2, 4)
+        v = v.reshape(T, B, N, self.h, self.dh).permute(0, 1, 3, 2, 4)
+
+        logits = (q @ k.transpose(-2, -1)) * self.scale                   # (T,B,h,Lq,N)
+        if key_mask is not None:
+            logits = logits.masked_fill(~key_mask[None, :, None, None, :].bool(),
+                                        torch.finfo(logits.dtype).min)
+        attn = self.attn_drop(logits.softmax(dim=-1))
+        out = (attn @ v).permute(0, 1, 3, 2, 4).reshape(T, B, Lq, D)
+
+        out = self.proj(out.flatten(0, 1))
+        out = self.proj_bn(out.transpose(-1, -2)).transpose(-1, -2).reshape(T, B, Lq, D)
+        out = self.proj_lif(out)
+        return (out, attn) if return_attn else out
+
+
+class SpatialBlock(nn.Module):
+    """SpatialCrossAttention + CMSF's spiking gated MLP, residual."""
+
+    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 2.0):
+        super().__init__()
+        cmsf = forks.load_cmsf()
+        self.attn = SpatialCrossAttention(dim, num_heads)
+        with forks.allow_cupy_construction():
+            self.mlp = cmsf.Spiking_GFNN(dim=dim, hidden_dim=int(dim * mlp_ratio))
+        forks.use_torch_backend(self)
+
+    def forward(self, x, y, key_mask=None, return_attn: bool = False):
+        if return_attn:
+            a, attn = self.attn(x, y, y, key_mask, return_attn=True)
+            x = x + a
+            return x + self.mlp(x), attn
+        x = x + self.attn(x, y, y, key_mask)
+        return x + self.mlp(x)
+
+
+# ----------------------------------------------------------------------------- model
 class RefCOCOGrounding(nn.Module):
     """forward(rgb, input_ids, attention_mask) -> (B, 4) normalised cxcywh.
 
-    One box, train and eval alike -- no anchors, no scores, no argmax, so nothing to
-    threshold or NMS at inference.
-
     Args:
-        rgb_ckpt: SpiLiFormer ImageNet checkpoint. None starts the backbone from scratch,
-            which on 120k RefCOCO expressions is possible but wastes the one pretrained
-            visual prior available.
-        text_model: any HF encoder; must be the tokenizer the dataloader used.
-        img_size: (H, W) the dataloader emits. Used to size the positional table at the
-            backbone's /16 grid so it is exact rather than interpolated at every step.
-            Must be divisible by 16.
-        T: spiking timesteps for the fusion stack. See the module docstring.
-        rgb_T: SpiLiFormer's own internal timesteps. 1 is a single feature-extraction
-            pass; the checkpoint was trained at 4.
-        freeze_rgb / freeze_text: on Talk2Event, freezing BOTH encoders produced a
-            caption-blind model over 85 epochs (delta +0.0009) while unfreezing the vision
-            side gave +0.051 within two. The default here follows that result: vision
-            trains, text does not.
+        rgb_ckpt: SpiLiFormer ImageNet checkpoint for the vision encoder.
+        text_model: any HF encoder; must match the tokenizer the dataloader used.
+        img_size: (H, W) the dataloader emits. Sizes the positional table at the /16 grid
+            so it is exact rather than interpolated. Must be divisible by 16.
+        T: spiking timesteps for the fusion stack. A still image has no temporal axis, so
+            T here is purely simulation length -- but it still matters, because LIF
+            membranes integrate across timesteps and T=1 degenerates every neuron into a
+            plain threshold. Default 4, matching the SpiLiFormer checkpoint. Cost is
+            linear in T.
+        rgb_T: SpiLiFormer's own internal timesteps (see `VisionEncoder`).
+        freeze_rgb / freeze_text: default trains vision, freezes text. On Talk2Event,
+            freezing BOTH produced a caption-blind model over 85 epochs (delta +0.0009)
+            while unfreezing the vision side gave +0.051 within two.
         depth: SpatialBlocks. Each is cross-attention + a spiking gated MLP.
-        attn_type: "spatial_softmax" (default) or "cmsf_linear".
-        head_type: "pooled_mlp" (default) or "attn_softargmax". See
-            `_softargmax_box` for what the second one does and why it exists --
-            in short, `pooled_mlp` reads the box centre off a vector that has been
-            binarised by two LIF layers, which caps how precisely a centre can be
-            represented; `attn_softargmax` reads it off the attention map directly,
-            before that binarisation.
-        attn_map: which block's attention map `attn_softargmax` reads -- "last" (default)
-            or "mean" across blocks. Neither is obviously right; it is a flag so both can
-            be measured.
-        pos_std: init std of the vision positional embedding. Passed through to
-            `RgbTokens`; see its docstring on why this is a load-bearing knob, not
-            cosmetic.
-        text_unfreeze_last: unfreeze only the LAST N roberta encoder layers, trained at
-            `encoder_lr` alongside the vision backbone, while the rest of roberta stays
-            frozen. 0 (default) keeps the whole encoder frozen or fully unfrozen per
-            `freeze_text`, matching prior behaviour exactly.
+        attn_type: "spatial_softmax" (default) or "cmsf_linear" -- see module docstring.
+        head_type: "pooled_mlp" (default) or "attn_softargmax". MEASURED: on a 100-sample
+            200-epoch A/B, `attn_softargmax` collapsed to a near-constant box (pred std
+            0.0002 on cx/cy against gt std 0.14-0.23) and never beat its own epoch-0 val
+            mIoU, because the attention map it reads is statistically uniform. Do not
+            treat it as the better option; it is retained because the underlying
+            quantisation argument is untested rather than refuted, and it becomes
+            testable the moment the map carries location.
+        attn_map: which block's map `attn_softargmax` reads -- "last" or "mean".
+        pos_std: init std of the vision positional embedding (see `VisionEncoder`).
+        text_unfreeze_last: unfreeze only the last N roberta layers (see `TextEncoder`).
     """
 
     def __init__(
@@ -158,21 +297,16 @@ class RefCOCOGrounding(nn.Module):
         self.head_type = head_type
         self.attn_map = attn_map
 
-        # --- vision: SpiLiFormer over the RGB frame -------------------------------
-        # max_hw sized to this input so the positional table is used directly; RgbTokens
-        # interpolates it when the grid differs, which is correct but lossy every step.
-        self.vision = RgbTokens(
+        self.vision = VisionEncoder(
             rgb_ckpt, d_model=d_model, T_model=rgb_T,
             max_hw=(img_size[0] // 16, img_size[1] // 16), freeze=freeze_rgb,
             pos_std=pos_std,
         )
         self._disable_unused_backbone_grads()
+        self.text = TextEncoder(text_model, d_model=d_model, freeze=freeze_text,
+                                unfreeze_last=text_unfreeze_last)
 
-        # --- text: ANN roberta, frozen (optionally except its last N layers) ------
-        self.text = TextEmbedder(text_model, d_model=d_model, freeze=freeze_text,
-                                 unfreeze_last=text_unfreeze_last)
-
-        # --- spike coders: both sides arrive analog, CMSF's blocks want spikes -----
+        # spike coders: both sides arrive analog, CMSF's blocks want spike trains
         with forks.allow_cupy_construction():
             self.txt_coder = cmsf.RepeatTextEncoder(T, d_model)
             self.vis_norm = nn.LayerNorm(d_model)
@@ -192,9 +326,7 @@ class RefCOCOGrounding(nn.Module):
         forks.use_torch_backend(self)
         self._scale_attention_bn(attn_bn_gain)
 
-        # --- box head: identical to SpikeGroundingV2's, plus head_norm0 ------------
-        # head_norm0 is NOT in SpikeGroundingV2 -- see the docstring below. Applied
-        # unconditionally (both head_type values), so it is not an A/B variable itself.
+        # box head. head_norm0 is applied unconditionally -- see the module docstring.
         sy = forks.load_spikeyolo()
         self.head_norm0 = nn.LayerNorm(d_model)
         self.head_lif1 = sy.mem_update()
@@ -208,28 +340,22 @@ class RefCOCOGrounding(nn.Module):
         nn.init.zeros_(self.fc2.bias)
 
         if head_type == "attn_softargmax":
-            # Log-space so exp() is always positive and 0 is a safe, neutral init
-            # (exp(0) = 1, i.e. the attention map's own softmax temperature is
-            # unchanged the first time this scale is applied). See `_softargmax_box`.
+            # log space so exp() is positive and 0 is a neutral init (exp(0) = 1)
             self.attn_logit_scale = nn.Parameter(torch.zeros(1))
 
     def _disable_unused_backbone_grads(self) -> None:
         """Turn off grad for the SpiLiFormer parts `forward_features` never reaches.
 
-        MEASURED, not defensive: with the backbone unfrozen, 25 of its 256 tensors --
-        4.91M parameters -- came back with `grad is None` after a full backward. They are
-        the ImageNet classifier `head` (0.77M) and the lateral-inhibition `decoder`
-        feedback path with its two `prompt` vectors (4.13M), and `RgbTokens` uses only the
-        feedforward pass. Left on, they would be reported as trainable, carry AdamW's two
-        moment buffers each (~39MB of optimiser state), and never move -- so any
-        "trainable parameters" figure including them overstates the model by 7%.
+        MEASURED: with the backbone unfrozen, 25 of its 256 tensors -- 4.91M parameters --
+        came back with `grad is None` after a full backward. They are the ImageNet
+        classifier `head` (0.77M) and the lateral-inhibition `decoder` feedback path with
+        its two `prompt` vectors (4.13M). Left on, they would be reported as trainable,
+        carry AdamW's two moment buffers each (~39MB of optimiser state), and never move.
         """
         bb = self.vision.backbone
         for name in ("head", "decoder", "prompt", "prompt_2"):
             mod = getattr(bb, name, None)
-            if isinstance(mod, nn.Module):
-                mod.requires_grad_(False)
-            elif isinstance(mod, nn.Parameter):
+            if isinstance(mod, (nn.Module, nn.Parameter)):
                 mod.requires_grad_(False)
 
     def _scale_attention_bn(self, gain: float) -> None:
@@ -248,12 +374,8 @@ class RefCOCOGrounding(nn.Module):
                 nn.init.constant_(bn.weight, gain)
 
     def reset(self) -> None:
-        """Zero every spikingjelly membrane.
-
-        Per-neuron rather than `functional.reset_net(self)`: that helper calls `.reset()`
-        on every submodule that has one, which includes THIS module, and recurses until
-        the stack blows.
-        """
+        """Zero every spikingjelly membrane. Per-neuron: `reset_net(self)` would call this
+        very method on the way down and recurse."""
         for m in self.modules():
             if isinstance(m, sj_neuron.BaseNode):
                 m.reset()
@@ -272,76 +394,58 @@ class RefCOCOGrounding(nn.Module):
             "text.proj": sum(p.numel() for p in self.text.proj.parameters()
                              if p.requires_grad),
             "fusion": sum(p.numel() for p in self.blocks.parameters() if p.requires_grad),
-            "head": sum(p.numel() for m in (self.head_norm0, self.fc1, self.head_norm, self.fc2)
+            "head": sum(p.numel()
+                        for m in (self.head_norm0, self.fc1, self.head_norm, self.fc2)
                         for p in m.parameters() if p.requires_grad)
                     + (self.attn_logit_scale.numel()
                        if self.head_type == "attn_softargmax" else 0),
         }
         return {k: v for k, v in out.items() if v}
 
-    def _softargmax_box(self, raw: torch.Tensor, attn_maps: list[torch.Tensor],
-                        attention_mask: torch.Tensor) -> torch.Tensor:
+    def _softargmax_box(self, raw, attn_maps, attention_mask) -> torch.Tensor:
         """Read the box centre off the attention map, size off the MLP.
 
-        `raw` is (T,B,4) from the same `fc2` as `pooled_mlp`; only how its first two
-        columns are used differs -- they become a bounded offset onto a softargmax
-        centre rather than the centre itself. Columns 2:4 (width, height) are read the
-        same way in both head types, per the research-log finding that size is "nearly
-        solved" and centre placement is the entire error (oracle swap: true centre +
-        predicted size -> mIoU 0.4814 vs 0.2195 baseline; true size + predicted centre
-        -> only 0.2407).
+        `raw` is (T,B,4) from the same `fc2` as `pooled_mlp`; only its first two columns
+        are used differently -- as a bounded offset onto a softargmax centre rather than
+        the centre itself. Columns 2:4 are read identically in both heads.
 
-        Why this exists: `pooled_mlp`'s centre comes from a vector that has been
-        through TWO binarising LIF layers (`head_lif1`, `head_lif2`). With q/k both
-        spike-valued and `dh=32`, the pre-softmax attention logits inside
-        `SpatialCrossAttention` already take at most 33 distinct values over ~576 keys
-        -- run `tools/diagnose.py` to check this on a real checkpoint -- and pooling +
-        binarising on top of that caps how precisely a centre can be represented at
-        all, independent of how well the model has learned. `attn_softargmax` instead
-        takes the expectation of position under the (real-valued, not yet binarised)
-        attention map itself.
-
-        MUST run in fp32: `attn.float()` and `raw.float()` below are not defensive.
-        Everything upstream of this method stays in whatever dtype it was trained in
-        -- these spiking layers are not dtype-agnostic, and bf16 vs fp32 measured
-        0.656 vs 0.060 IoU on identical weights elsewhere in this codebase -- but THIS
-        block crosses no spiking threshold, and bf16's 8-bit mantissa would quantise
-        the very centre estimate this method exists to recover.
+        MUST run in fp32. Everything upstream stays in whatever dtype it was trained in --
+        these spiking layers are not dtype-agnostic -- but this block crosses no threshold,
+        and bf16's 8-bit mantissa would quantise the very centre estimate it exists to
+        recover.
         """
-        chosen = attn_maps[-1] if self.attn_map == "last" else torch.stack(attn_maps, 0).mean(0)
-        a = chosen.float().mean(dim=(0, 2))                    # (B,Lq,N): mean over T, heads
-        w = attention_mask.to(a.dtype).unsqueeze(-1)           # (B,Lq,1)
+        chosen = (attn_maps[-1] if self.attn_map == "last"
+                  else torch.stack(attn_maps, 0).mean(0))
+        a = chosen.float().mean(dim=(0, 2))                    # (B,Lq,N) over T and heads
+        w = attention_mask.to(a.dtype).unsqueeze(-1)
         heat = (a * w).sum(1) / w.sum(1).clamp(min=1.0)        # (B,N) real tokens only
 
         Hg, Wg = self.img_size[0] // 16, self.img_size[1] // 16
         if heat.shape[-1] != Hg * Wg:
             raise RuntimeError(f"{heat.shape[-1]} keys but grid is {Hg}x{Wg} "
-                               f"({Hg * Wg}) -- a second vision stream breaks the "
-                               f"row-major index this method assumes")
+                               f"({Hg * Wg}) -- a second vision stream would break the "
+                               f"row-major index this assumes")
         p = (heat * self.attn_logit_scale.exp()).softmax(-1).view(-1, Hg, Wg)
-        # token index n = row * Wg + col (RgbTokens.forward: reshape(B,d,H*W) flattens
-        # (H,W) row-major), so p.sum(1) marginalises OUT rows -> the column
-        # distribution, paired with `xs`; p.sum(2) marginalises out columns -> the row
-        # distribution, paired with `ys`. Get this backwards and training still
-        # converges to a plausible-looking loss with the grid transposed underneath it.
+        # token index n = row * Wg + col (VisionEncoder flattens (H,W) row-major), so
+        # p.sum(1) marginalises OUT rows -> the column distribution, paired with `xs`;
+        # p.sum(2) -> the row distribution, paired with `ys`. Getting this backwards
+        # still converges to a plausible loss, with the grid silently transposed.
         xs = torch.linspace(0.5 / Wg, 1 - 0.5 / Wg, Wg, device=p.device, dtype=p.dtype)
         ys = torch.linspace(0.5 / Hg, 1 - 0.5 / Hg, Hg, device=p.device, dtype=p.dtype)
         cx = (p.sum(1) * xs).sum(-1)
         cy = (p.sum(2) * ys).sum(-1)
 
-        r = raw.mean(0).float()                                # (B,4), collapse T like pooled_mlp
+        r = raw.mean(0).float()                                # (B,4), collapse T
         cx = (cx + torch.tanh(r[:, 0]) / Wg).clamp(0, 1)
         cy = (cy + torch.tanh(r[:, 1]) / Hg).clamp(0, 1)
         return torch.stack([cx, cy, r[:, 2].sigmoid(), r[:, 3].sigmoid()], dim=-1)
 
-    def forward(self, rgb: torch.Tensor, input_ids: torch.Tensor,
-                attention_mask: torch.Tensor, return_diagnostics: bool = False):
+    def forward(self, rgb, input_ids, attention_mask, return_diagnostics: bool = False):
         """rgb (B,3,H,W); input_ids (B,L); attention_mask (B,L) -> (B,4) cxcywh in [0,1].
 
-        `return_diagnostics=True` additionally returns a dict with the raw attention
-        maps and the pooled pre-head vector, for `tools/diagnose.py`. It costs nothing
-        extra when False: attention maps are only requested from the blocks when either
-        this flag or `head_type == "attn_softargmax"` needs them.
+        `return_diagnostics=True` also returns the attention maps and pooled vector for
+        `tools/diagnose.py`. It costs nothing when False -- maps are only requested from
+        the blocks when the flag or the head actually needs them.
         """
         if rgb.dim() != 4 or rgb.shape[1] != 3:
             raise ValueError(f"expected (B,3,H,W) rgb, got {tuple(rgb.shape)}")
@@ -379,7 +483,7 @@ class RefCOCOGrounding(nn.Module):
         raw = self.fc2(x.flatten(0, 1)).reshape(*pooled.shape[:2], 4)   # (T,B,4)
 
         if self.head_type == "pooled_mlp":
-            box = raw.mean(0).sigmoid()                      # (B,4) normalised cxcywh
+            box = raw.mean(0).sigmoid()
         else:
             box = self._softargmax_box(raw, attn_maps, attention_mask)
 
@@ -392,9 +496,8 @@ class RefCOCOGrounding(nn.Module):
         """Eval-mode boxes, (B,4) normalised cxcywh.
 
         Autocasts to bf16 because that is the dtype these layers are trained in and they
-        are NOT dtype-agnostic -- precision decides which membranes cross threshold.
-        Measured on a same-frame overfit set: bf16 0.656 IoU vs fp32 0.060, identical
-        weights and mode. Pass `amp=False` only to reproduce that comparison.
+        are NOT dtype-agnostic. Measured on a same-frame overfit set: bf16 0.656 IoU vs
+        fp32 0.060, identical weights and mode. Pass `amp=False` only to reproduce that.
         """
         was = self.training
         self.eval()

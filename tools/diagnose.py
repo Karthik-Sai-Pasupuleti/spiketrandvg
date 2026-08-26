@@ -39,10 +39,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from spiketrandvg.datasets.refcoco import RefCOCO, make_collate
-from spiketrandvg.model import RefCOCOGrounding
-from spiketrandvg.models.grounding_loss import cxcywh_to_xyxy_norm
-from spiketrandvg.models.text_embedder import build_tokenizer
+from spiketrandvg.dataset import RefCOCO, make_collate
+from spiketrandvg.model import RefCOCOGrounding, cxcywh_to_xyxy_norm
+from spiketrandvg.text_encoder import build_tokenizer
 from torchvision.ops import box_iou
 
 
