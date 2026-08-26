@@ -37,6 +37,7 @@ FORKS = {
     "sfod": REPOS / "SFOD",
     "e3dsnn": REPOS / "E-3DSNN",
     "cmsf": REPOS / "CMSF",
+    "spiliformer": REPOS / "SpiLiFormer",
 }
 
 
@@ -382,3 +383,86 @@ def load_cmsf() -> types.SimpleNamespace:
         RepeatTextEncoder=mod.RepeatTextEncoder,
         Dynamic_Threshold_LIFNode=mod.Dynamic_Threshold_LIFNode,
     )
+
+
+@lru_cache(maxsize=1)
+def load_spiliformer():
+    """SpiLiFormer's spiking transformer (ICCV 2025), the RGB branch of the hybrid model.
+
+    Returns the `Spike_Lateral_Transformer` class and the `SpiLiFormer_10_768` factory.
+
+    Architecture, verified against the source: a convolutional stem (`PatchEmbedInit`, two
+    stride-2 maxpools -> /4) then three stages at 192 / 384 / 768 channels, each preceded
+    by a patch-embedding downsample, so `forward_features` returns a (T, B, 768, H/16,
+    W/16) SPATIAL map -- not a pooled classification vector. At 480x640 that is a 30x40
+    grid, the same resolution as the event backbone's s16 tap.
+
+    Two things the fork does that matter to a caller:
+
+    * `forward()` replicates one frame across T (`x.unsqueeze(0).repeat(T,...)`), which is
+      right for a static RGB image but means T is the model's own, independent of the event
+      stream's.
+    * The lateral-inhibition feedback path is a TWO-pass design: the first pass returns
+      `(x, tmp)` plus a feedback tensor, and a second pass consumes it. `forward_features`
+      with `second_forward=None` gives the feedforward features on their own, which is what
+      a feature extractor wants.
+
+    Loading: `spiliformer.py` does `from util.factory import Decoder`, so the ImageNet
+    directory is put on `sys.path` for the duration of the import and removed afterwards,
+    keeping the generic name `util` out of the process (the same trick used elsewhere here).
+    """
+    # `einops.layers.torch.Rearrange` is imported at module scope and never used
+    # (verified by grep over spiliformer.py and util/factory.py), so a stub suffices.
+    _stub("torchinfo")
+    _stub("einops")
+    _stub("einops.layers")
+    _stub("einops.layers.torch", Rearrange=object)
+    d = FORKS["spiliformer"] / "imagetnet_1k"
+    if not d.is_dir():
+        raise FileNotFoundError(f"SpiLiFormer fork missing: {d}")
+    added = str(d)
+    had = added in sys.path
+    if not had:
+        sys.path.insert(0, added)
+    try:
+        mod = _load_file("spiliformer_model", d / "spiliformer.py")
+    finally:
+        if not had and added in sys.path:
+            sys.path.remove(added)
+        for name in [k for k in list(sys.modules) if k == "util" or k.startswith("util.")]:
+            sys.modules.pop(name, None)
+    _fix_spiliformer_square_assumption(mod)
+    return types.SimpleNamespace(
+        Spike_Lateral_Transformer=mod.Spike_Lateral_Transformer,
+        SpiLiFormer_10_768=mod.SpiLiFormer_10_768,
+    )
+
+
+def _fix_spiliformer_square_assumption(mod) -> None:
+    """Correct two transposed reshapes that only work on a SQUARE feature grid.
+
+    `MLP.forward` (spiliformer.py:43) and `FB_LiDiff_Attention.forward` (:157) both end in
+    `.reshape(T, B, C, W, H)` -- width and height the wrong way round. On ImageNet's 14x14
+    grid H == W so the error is invisible and the released weights are unaffected. On a
+    480x640 frame the grid is 30x40 and the block returns a (..., 40, 30) tensor, which
+    then fails to add to its own (..., 30, 40) residual. `FF_LiDiff_Attention` (:94) has it
+    right, so this is a slip in two of three places rather than a convention.
+
+    Patched by wrapping `forward` on the in-memory classes: if the input grid was
+    non-square and the output comes back transposed, transpose it back. On square inputs
+    the wrapper is a no-op, so ImageNet behaviour is bit-identical.
+    """
+    for cls in (mod.MLP, mod.FB_LiDiff_Attention):
+        if getattr(cls, "_hw_patched", False):
+            continue
+        original = cls.forward
+
+        def forward(self, x, *args, _orig=original, **kwargs):
+            h, w = x.shape[-2:]
+            out = _orig(self, x, *args, **kwargs)
+            if h != w and out.shape[-2:] == (w, h):
+                out = out.transpose(-1, -2).contiguous()
+            return out
+
+        cls.forward = forward
+        cls._hw_patched = True

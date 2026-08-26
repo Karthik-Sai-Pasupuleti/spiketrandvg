@@ -1,11 +1,13 @@
 """SpikeGroundingV2: frozen pretrained encoders, text-queried cross-attention, one box.
 
-    events (T,B,2,480,640)              text tokens (B, L, d_model)
-            |                                       |
-    DetectionBackbone  [FROZEN]            <supplied by the caller>
-    SpikeYOLO, mAP@0.5 0.5307 on           any encoder producing (B,L,d)
-    Talk2Event detection
-            |  s8 / s16 taps                        |
+    events (T,B,2,480,640)   rgb (B,3,480,640)   text tokens (B,L,d_model)
+            |                        |                        |
+    DetectionBackbone          SpiLiFormer            <supplied by the caller>
+    SpikeYOLO, Talk2Event      ICCV 2025, ImageNet    roberta by default, FROZEN
+    detection mAP@0.5 0.5307   85.82% @ T=4
+            | s8 / s16               | /16                    |
+      lateral + learnable 2D pos on each                      |
+            +--- concatenated vision tokens ---+              |
       lateral 1x1 + learnable 2D pos                |
             |  (T,B,N_vis,256) vision tokens        |
             +-----------> TextQueryFusion <---------+
@@ -63,13 +65,22 @@ import math
 
 import torch
 import torch.nn as nn
+from spikingjelly.clock_driven import functional as _sjf
 from spikingjelly.clock_driven import neuron as sj_neuron
+
+
+def sj_reset(module: nn.Module) -> None:
+    """Zero every spikingjelly membrane inside `module` (never the caller itself)."""
+    for m in module.modules():
+        if isinstance(m, sj_neuron.BaseNode):
+            m.reset()
 
 from spiketrandvg.datasets.events_voxel_cube import T_STEPS
 from spiketrandvg.models.spikeyolo_detector import DetectionBackbone
 from spiketrandvg.utils import forks
 
-__all__ = ["SpikeGroundingV2", "SpatialCrossAttention", "build_grounding_v2"]
+__all__ = ["SpikeGroundingV2", "SpatialCrossAttention", "RgbTokens", "VisionTokens",
+           "build_grounding_v2"]
 
 DEFAULT_TAPS = ("s8", "s16")
 
@@ -242,6 +253,93 @@ class VisionTokens(nn.Module):
         return torch.cat(out, dim=2)                       # (T, B, N, d_model)
 
 
+class RgbTokens(nn.Module):
+    """SpiLiFormer over the RGB frame -> positional, projected tokens.
+
+    forward(rgb) : (B, 3, H, W) -> (T_out, B, N, d_model), the T axis broadcast because a
+    still image is constant over the event window.
+
+    SpiLiFormer (ICCV 2025) is a spiking transformer with lateral inhibition, ImageNet
+    85.82% at T=4. Its stem is convolutional and its stages are hierarchical, so
+    `forward_features` yields a (T, B, 768, H/16, W/16) SPATIAL map -- at 480x640 a 30x40
+    grid, the same resolution as the event backbone's s16 tap, which is why the two streams
+    concatenate cleanly.
+
+    What the RGB stream adds that events cannot carry
+    -------------------------------------------------
+    Talk2Event captions were written from RGB. Colour and appearance ("a white SUV", "a
+    bright orange compact car") have no counterpart in a brightness-change stream. Measured
+    over 4,929 same-frame caption pairs, only 0.4% are separated by colour ALONE -- so this
+    is not the difference between possible and impossible -- but colour appears in a large
+    share of captions as corroborating evidence, and the event branch simply cannot see it.
+
+    Only the feedforward pass is used. SpiLiFormer's lateral-inhibition feedback is a
+    two-pass design whose second pass exists to sharpen a classification decision; a
+    feature extractor wants the features.
+    """
+
+    def __init__(
+        self,
+        ckpt: str | None = None,
+        d_model: int = 256,
+        T_model: int = 1,
+        max_hw: tuple[int, int] = (30, 40),
+        freeze: bool = False,
+    ):
+        super().__init__()
+        sl = forks.load_spiliformer()
+        with forks.allow_cupy_construction():
+            self.backbone = sl.SpiLiFormer_10_768(T=T_model)
+        forks.use_torch_backend(self.backbone)
+        self.T_model = T_model
+        self.report = {}
+        if ckpt:
+            blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+            sd = blob.get("model", blob)
+            msg = self.backbone.load_state_dict(sd, strict=False)
+            self.report = {"loaded": len(sd) - len(msg.unexpected_keys),
+                           "missing": len(msg.missing_keys),
+                           "unexpected": len(msg.unexpected_keys)}
+            print(f"[grounding_v2] SpiLiFormer from {ckpt}: "
+                  f"{self.report['loaded']}/{len(sd)} tensors "
+                  f"(missing {self.report['missing']}, unexpected {self.report['unexpected']})")
+        self.frozen = freeze
+        self.backbone.requires_grad_(not freeze)
+
+        self.lateral = nn.Conv2d(768, d_model, kernel_size=1)
+        self.pos = nn.Parameter(torch.zeros(1, d_model, *max_hw))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.d_model = d_model
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.frozen:
+            self.backbone.eval()
+        return self
+
+    def forward(self, rgb: torch.Tensor, T_out: int) -> torch.Tensor:
+        if rgb.dim() != 4 or rgb.shape[1] != 3:
+            raise ValueError(f"expected (B, 3, H, W) rgb, got {tuple(rgb.shape)}")
+        # membranes persist across calls AND are shaped by the last input's resolution,
+        # so a reset is mandatory, not hygiene
+        sj_reset(self.backbone)
+        ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
+        with ctx:
+            x = rgb.unsqueeze(0).repeat(self.T_model, 1, 1, 1, 1)
+            feats, _tmp = self.backbone.forward_features(x)      # (Tm,B,768,H/16,W/16)
+        feats = feats.mean(0)                                    # collapse SpiLiFormer's T
+
+        B, C, H, W = feats.shape
+        y = self.lateral(feats)
+        pos = self.pos
+        if pos.shape[-2:] != (H, W):
+            pos = nn.functional.interpolate(pos, size=(H, W), mode="bilinear",
+                                            align_corners=False)
+        y = y + pos
+        tok = y.reshape(B, self.d_model, H * W).permute(0, 2, 1)  # (B, N, d)
+        return tok.unsqueeze(0).expand(T_out, -1, -1, -1)         # (T_out, B, N, d)
+
+
 class SpikeGroundingV2(nn.Module):
     """forward(cube, input_ids, attention_mask) -> (B, 4) normalised cxcywh.
 
@@ -254,7 +352,11 @@ class SpikeGroundingV2(nn.Module):
         taps: tuple[str, ...] = DEFAULT_TAPS,
         T: int = T_STEPS,
         backbone_ckpt: str | None = None,
+        rgb_ckpt: str | None = None,
+        use_rgb: bool = False,
+        rgb_T: int = 1,
         freeze_vision: bool = True,
+        freeze_rgb: bool = False,
         depth: int = 2,
         num_heads: int = 8,
         mlp_ratio: float = 2.0,
@@ -268,6 +370,10 @@ class SpikeGroundingV2(nn.Module):
         self.d_model = d_model
 
         self.vision = VisionTokens(backbone_ckpt, taps, d_model, freeze=freeze_vision)
+        # second vision stream: SpiLiFormer over the RGB frame. Optional, because the
+        # event-only configuration remains the comparison baseline.
+        self.rgb = (RgbTokens(rgb_ckpt, d_model=d_model, T_model=rgb_T, freeze=freeze_rgb)
+                    if use_rgb else None)
 
         with forks.allow_cupy_construction():
             # spike coders: both sides arrive analog, CMSF's blocks expect spike trains
@@ -326,14 +432,20 @@ class SpikeGroundingV2(nn.Module):
         out = {k: sum(p.numel() for p in m.parameters() if p.requires_grad)
                for k, m in groups.items()}
         out["vision.pos"] = sum(p.numel() for p in self.vision.pos.values()) + self.level_numel
+        if self.rgb is not None:
+            out["rgb.backbone"] = sum(p.numel() for p in self.rgb.backbone.parameters()
+                                      if p.requires_grad)
+            out["rgb.lateral+pos"] = (sum(p.numel() for p in self.rgb.lateral.parameters())
+                                      + self.rgb.pos.numel())
         return out
 
     @property
     def level_numel(self) -> int:
         return self.vision.level.numel()
 
-    def forward(self, cube, text_tokens, attention_mask) -> torch.Tensor:
-        """cube (T,B,2,H,W); text_tokens (B,L,d_model); attention_mask (B,L)."""
+    def forward(self, cube, text_tokens, attention_mask, rgb=None) -> torch.Tensor:
+        """cube (T,B,2,H,W); text_tokens (B,L,d_model); attention_mask (B,L);
+        rgb (B,3,H,W) when the model was built with `use_rgb=True`."""
         if cube.dim() != 5 or cube.shape[0] != self.T:
             raise ValueError(f"expected (T={self.T}, B, 2, H, W), got {tuple(cube.shape)}")
         if text_tokens.dim() != 3 or text_tokens.shape[-1] != self.d_model:
@@ -345,8 +457,15 @@ class SpikeGroundingV2(nn.Module):
             raise ValueError(f"token/mask length mismatch {text_tokens.shape[1]} vs "
                              f"{attention_mask.shape[1]}")
 
+        if (self.rgb is not None) != (rgb is not None):
+            raise ValueError("rgb stream and rgb input must both be present or both absent")
+
         self.reset()
-        vis = self.vision(cube)                                   # (T,B,N,d) analog
+        vis = self.vision(cube)                                   # (T,B,N_ev,d) analog
+        if self.rgb is not None:
+            # one token sequence over both modalities: the caption attends across events
+            # and RGB together, so a phrase can draw on whichever carries its evidence
+            vis = torch.cat([vis, self.rgb(rgb, vis.shape[0])], dim=2)
 
         # spike-code both sides
         v = self.vis_lif(self.vis_norm(vis))                      # (T,B,N,d)
@@ -367,7 +486,8 @@ class SpikeGroundingV2(nn.Module):
         return x.mean(0).sigmoid()                                # (B,4)
 
     @torch.no_grad()
-    def predict(self, cube, text_tokens, attention_mask, amp: bool = True) -> torch.Tensor:
+    def predict(self, cube, text_tokens, attention_mask, rgb=None,
+                amp: bool = True) -> torch.Tensor:
         """(B,4) xyxy in pixels.
 
         Runs under bf16 autocast by default because that is the dtype the model is
@@ -382,7 +502,7 @@ class SpikeGroundingV2(nn.Module):
                if amp and cube.is_cuda else contextlib.nullcontext())
         try:
             with ctx:
-                b = self(cube, text_tokens, attention_mask)
+                b = self(cube, text_tokens, attention_mask, rgb)
             b = b.float()
         finally:
             self.train(was)

@@ -1,0 +1,11 @@
+{
+ "n": 7665,
+ "mIoU": 0.3335,
+ "Acc@0.25": 0.5636,
+ "Acc@0.5": 0.3087,
+ "Acc@0.75": 0.0746,
+ "Acc@0.9": 0.0052,
+ "blind_mIoU": 0.3163,
+ "caption_delta": 0.0172,
+ "_WARNING": "caption_delta INVALID: the blind control rotates captions within a batch of consecutive samples, and Talk2Event stores each object's 3 captions consecutively, so 50.0% of the 'wrong' captions describe the SAME box. Use caption_delta_strata.json instead."
+}

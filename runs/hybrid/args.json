@@ -1,0 +1,32 @@
+{
+ "run_name": "hybrid",
+ "epochs": 40,
+ "max_iters": null,
+ "batch_size": 4,
+ "accum": 1,
+ "lr": 0.0005,
+ "weight_decay": 0.0001,
+ "warmup": 500,
+ "clip": 10.0,
+ "depth": 2,
+ "attn_type": "spatial_softmax",
+ "backbone_ckpt": "runs/det_aug/backbone.pth",
+ "freeze_vision": false,
+ "use_rgb": true,
+ "rgb_ckpt": "ckpts/spiliformer/checkpoint_spiliformer_T4_224.pth",
+ "rgb_T": 1,
+ "freeze_rgb": false,
+ "text_model": "roberta-base",
+ "freeze_text": true,
+ "encoder_lr": 1e-05,
+ "taps": [
+  "s8",
+  "s16"
+ ],
+ "workers": 6,
+ "eval_samples": 800,
+ "blind_every": 1,
+ "patience": 12,
+ "log_every": 1000,
+ "resume": null
+}

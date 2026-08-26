@@ -1,0 +1,13 @@
+{
+ "_note": "measured on runs/hybrid/best.pth (epoch 32) before that file was lost",
+ "n": 7665,
+ "n_hasC": 6318,
+ "A_correct": 0.3343,
+ "B_same_object": 0.3341,
+ "C_same_frame_other_object": 0.0822,
+ "D_diff_frame": 0.1035,
+ "mIoU_A_on_C_subset": 0.3022,
+ "delta_B_paraphrase": 0.0002,
+ "delta_C_same_frame_other_object": 0.22,
+ "delta_D_diff_frame": 0.2308
+}
