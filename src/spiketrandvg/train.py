@@ -42,6 +42,19 @@ SAME image, which is available for 97.8% of RefCOCO val. Same scene, same distra
 only the referent differs -- the hardest honest negative, and the one that measures
 referring-expression grounding rather than scene recognition. Samples with no such sibling
 fall back to a different image and are counted separately.
+
+train_mIoU: the metric that catches a broken eval path
+--------------------------------------------------------
+The `train-IoU` printed during the epoch loop is measured DURING training -- BatchNorm on
+batch statistics, dropout active where applicable, LIF thresholds responding to whatever
+that specific mini-batch looks like. `evaluate()` runs in eval mode: running BatchNorm
+statistics, dropout off. Both respond to the SAME weights differently, so a model that has
+genuinely fitted its training set can look identical, in the epoch line, to one whose eval
+path is silently broken -- the only way to tell them apart is to score the training set
+itself through `evaluate()`. `train_mIoU` in `log.tsv` and the printed `(mode gap ...)`
+are exactly that: a `RefCOCO(split="train")` set, unaugmented, scored the same way `val`
+is. A large, persistent gap here means look here BEFORE trusting any other number in this
+file.
 """
 
 from __future__ import annotations
@@ -155,6 +168,18 @@ def main() -> None:
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--attn-type", default="spatial_softmax",
                     choices=["spatial_softmax", "cmsf_linear"])
+    ap.add_argument("--head-type", default="pooled_mlp",
+                    choices=["pooled_mlp", "attn_softargmax"],
+                    help="pooled_mlp: centre from a binarised pooled vector (prior "
+                         "behaviour, plus head_norm0). attn_softargmax: centre read "
+                         "off the attention map itself, before it is binarised -- "
+                         "see model.py RefCOCOGrounding._softargmax_box")
+    ap.add_argument("--attn-map", default="last", choices=["last", "mean"],
+                    help="which block's attention map attn_softargmax reads")
+    ap.add_argument("--pos-std", type=float, default=0.02,
+                    help="init std of the vision positional embedding")
+    ap.add_argument("--center-weight", type=float, default=1.0,
+                    help="extra weight on the L1 cx/cy terms (w/h stay at 1.0)")
     ap.add_argument("--rgb-ckpt", default="ckpts/spiliformer/checkpoint_spiliformer_T4_224.pth")
     ap.add_argument("--text-model", default="roberta-base")
     # The text encoder is frozen and the flag exists to record that choice in args.json,
@@ -163,11 +188,17 @@ def main() -> None:
     # overwrites that before the 1.3M fusion learns to read it.
     ap.add_argument("--train-text", action="store_true",
                     help="unfreeze roberta (default: frozen)")
+    ap.add_argument("--text-unfreeze-last", type=int, default=0,
+                    help="unfreeze only the last N roberta layers, at --encoder-lr; "
+                         "ignored if --train-text is set (already fully unfrozen)")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--jitter", type=float, default=0.0)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--eval-samples", type=int, default=2000,
                     help="strided subset of the val split; 0 = all")
+    ap.add_argument("--train-eval-samples", type=int, default=2000,
+                    help="strided subset of TRAIN scored in eval mode every epoch "
+                         "(train_mIoU); 0 = all. See the module docstring.")
     ap.add_argument("--blind-every", type=int, default=1, help="0 disables")
     ap.add_argument("--patience", type=int, default=8, help="0 disables early stopping")
     ap.add_argument("--log-every", type=int, default=200, help="optimiser steps")
@@ -190,6 +221,10 @@ def main() -> None:
 
     train_ds = RefCOCO(args.dataset, "train", size=size, augment=aug, limit=args.limit_train)
     val_ds = RefCOCO(args.dataset, args.val_split, size=size, augment=None)
+    # Same samples the model trains on (respects --limit-train), unaugmented, scored
+    # through the same evaluate() as val -- see the module docstring on train_mIoU.
+    train_eval_ds = RefCOCO(args.dataset, "train", size=size, augment=None,
+                            limit=args.limit_train)
 
     # Precomputed hard negatives -- see the module docstring for why a batch shuffle is
     # not an acceptable substitute here.
@@ -199,6 +234,9 @@ def main() -> None:
     idxs = (list(range(len(val_ds))) if not args.eval_samples else
             list(range(0, len(val_ds), max(1, len(val_ds) // args.eval_samples))))
     keep = [is_hard[i] for i in idxs]
+    train_eval_idxs = (list(range(len(train_eval_ds))) if not args.train_eval_samples else
+                       list(range(0, len(train_eval_ds),
+                                  max(1, len(train_eval_ds) // args.train_eval_samples))))
 
     def loader(ds, shuffle=False, subset=None):
         src = Subset(ds, subset) if subset is not None else ds
@@ -209,15 +247,22 @@ def main() -> None:
     train_dl = loader(train_ds, shuffle=True)
     val_dl = loader(val_ds, subset=idxs)
     blind_dl = loader(blind_ds, subset=idxs)
+    train_eval_dl = loader(train_eval_ds, subset=train_eval_idxs)
 
     model = RefCOCOGrounding(
         rgb_ckpt=args.rgb_ckpt, text_model=args.text_model, img_size=size,
         T=args.T, rgb_T=args.rgb_T, depth=args.depth, attn_type=args.attn_type,
         freeze_rgb=False, freeze_text=not args.train_text,
+        head_type=args.head_type, attn_map=args.attn_map, pos_std=args.pos_std,
+        text_unfreeze_last=0 if args.train_text else args.text_unfreeze_last,
     ).to(device)
-    crit = SingleBoxLoss().to(device)
+    crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
-    backbone_ids = {id(p) for p in model.vision.backbone.parameters()}
+    # Both the vision backbone AND any unfrozen tail of roberta (item 8) are pretrained
+    # weights and share encoder_lr; "new" is everything randomly initialised.
+    pretrained_sources = list(model.vision.backbone.parameters()) + \
+        list(model.text.encoder.parameters())
+    backbone_ids = {id(p) for p in pretrained_sources}
     enc = [p for p in model.parameters() if p.requires_grad and id(p) in backbone_ids]
     new = [p for p in model.parameters() if p.requires_grad and id(p) not in backbone_ids]
     groups = [g for g in ({"params": enc, "lr": args.encoder_lr},
@@ -253,8 +298,12 @@ def main() -> None:
     print(f"device {device} | bf16 train AND eval | batch {args.batch_size} x accum {args.accum}")
     print(f"{args.dataset}: train {len(train_ds)} | val {len(val_ds)} "
           f"(eval on {len(idxs)}, {sum(keep)} with a same-image hard negative)")
-    print(f"attn {args.attn_type} | depth {args.depth} | T {args.T} | size {size[0]}x{size[1]}")
-    print(f"text {args.text_model} {'TRAINABLE' if args.train_text else 'FROZEN'} | "
+    print(f"attn {args.attn_type} | head {args.head_type} (attn_map={args.attn_map}) | "
+          f"depth {args.depth} | T {args.T} | size {size[0]}x{size[1]}")
+    text_state = ("TRAINABLE" if args.train_text else
+                 f"last {args.text_unfreeze_last} layers @ lr {args.encoder_lr}"
+                 if args.text_unfreeze_last else "FROZEN")
+    print(f"text {args.text_model} {text_state} | "
           f"backbone @ lr {args.encoder_lr} | new modules @ lr {args.lr}")
     print(f"trainable {n_tr/1e6:.2f}M of {n_all/1e6:.1f}M  " +
           "  ".join(f"{k} {v/1e6:.2f}M" for k, v in tp.items()))
@@ -262,8 +311,8 @@ def main() -> None:
 
     if not (out / "log.tsv").exists():
         (out / "log.tsv").write_text(
-            "epoch\tstep\tloss\tl1\tciou\ttrain_iou\tlr\tmIoU\tAcc@0.25\tAcc@0.5\t"
-            "Acc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tsec\n")
+            "epoch\tstep\tloss\tl1\tciou\ttrain_iou\ttrain_mIoU\tlr\tmIoU\tAcc@0.25\t"
+            "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tsec\n")
 
     t0 = time.time()
     stop = False
@@ -301,6 +350,8 @@ def main() -> None:
                 break
 
         m = evaluate(model, val_dl, device, amp_ctx)
+        train_m = evaluate(model, train_eval_dl, device, amp_ctx)
+        mode_gap = train_m["mIoU"] - run["iou"] / seen
         blind = (evaluate(model, blind_dl, device, amp_ctx, keep=keep)
                  if args.blind_every and epoch % args.blind_every == 0 else None)
         # delta is computed on the SAME subset the blind score used -- the samples that
@@ -311,7 +362,7 @@ def main() -> None:
 
         print(f"EPOCH {epoch:3d} | loss {run['loss']/seen:6.3f} "
               f"(l1 {run['l1']/seen:.4f} ciou {run['ciou']/seen:.4f}) "
-              f"train-IoU {run['iou']/seen:.3f} | "
+              f"train-IoU {run['iou']/seen:.3f} (mode gap {mode_gap:+.4f}) | "
               f"mIoU {m['mIoU']:.4f}  Acc@0.25 {m['Acc@0.25']:.4f}  "
               f"Acc@0.5 {m['Acc@0.5']:.4f}  Acc@0.75 {m['Acc@0.75']:.4f}  "
               f"Acc@0.9 {m['Acc@0.9']:.4f}"
@@ -320,7 +371,8 @@ def main() -> None:
 
         with open(out / "log.tsv", "a") as f:
             f.write(f"{epoch}\t{gstep}\t{run['loss']/seen:.4f}\t{run['l1']/seen:.4f}\t"
-                    f"{run['ciou']/seen:.4f}\t{run['iou']/seen:.4f}\t{mult:.4f}\t"
+                    f"{run['ciou']/seen:.4f}\t{run['iou']/seen:.4f}\t{train_m['mIoU']:.4f}\t"
+                    f"{mult:.4f}\t"
                     f"{m['mIoU']:.4f}\t{m['Acc@0.25']:.4f}\t{m['Acc@0.5']:.4f}\t"
                     f"{m['Acc@0.75']:.4f}\t{m['Acc@0.9']:.4f}\t"
                     f"{blind['mIoU'] if blind else float('nan'):.4f}\t{delta:.4f}\t"
