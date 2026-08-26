@@ -200,6 +200,10 @@ def main() -> None:
                          "(train_mIoU); 0 = all. See the module docstring.")
     ap.add_argument("--blind-every", type=int, default=1, help="0 disables")
     ap.add_argument("--patience", type=int, default=8, help="0 disables early stopping")
+    ap.add_argument("--keep-all-best", action="store_true",
+                    help="also archive a weights-only best_ep<N>_miou<X>.pth on every new "
+                         "best, instead of only overwriting best.pth. ~780MB each -- see "
+                         "the disk note before enabling for a long run")
     ap.add_argument("--log-every", type=int, default=200, help="optimiser steps")
     ap.add_argument("--max-iters", type=int, default=None, help="smoke test")
     ap.add_argument("--limit-train", type=int, default=None)
@@ -385,6 +389,14 @@ def main() -> None:
             blob["best"] = best
             torch.save(blob, out / "best.pth")
             print(f"         new best mIoU {best:.4f}", flush=True)
+            if args.keep_all_best:
+                # Archive copy, model weights ONLY -- no optimiser state, which is ~40% of
+                # the file and is useless for a snapshot you will never resume from.
+                # `best.pth` above stays the full resumable checkpoint.
+                snap = out / f"best_ep{epoch:03d}_miou{m['mIoU']:.4f}.pth"
+                torch.save({"model": model.state_dict(), "epoch": epoch,
+                            "args": vars(args), "metrics": m, "best": best}, snap)
+                print(f"         archived {snap.name}", flush=True)
         else:
             since_best += 1
             if args.patience and since_best >= args.patience:

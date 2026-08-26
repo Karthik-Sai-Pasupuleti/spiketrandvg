@@ -1,0 +1,13 @@
+{
+ "n": 10834,
+ "mIoU": 0.23814989626407623,
+ "Acc@0.25": 0.45578733086586,
+ "Acc@0.5": 0.10365515947341919,
+ "Acc@0.75": 0.00646114069968462,
+ "Acc@0.9": 0.0,
+ "blind_mIoU": 0.14095650613307953,
+ "mIoU_on_hard_subset": 0.23829542100429535,
+ "caption_delta": 0.09733891487121582,
+ "n_hard": 10593,
+ "_delta_note": "negatives are a caption for a DIFFERENT object in the SAME image; delta compares only the n_hard samples that have one"
+}
