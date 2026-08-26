@@ -58,17 +58,42 @@ class TextEmbedder(nn.Module):
         d_model: fusion width the grounding model expects.
         freeze: hold the encoder fixed (the projection always trains -- it has no
             pretrained counterpart, so freezing it would leave a random map in place).
+        unfreeze_last: unfreeze only the last N transformer layers (0 = respect `freeze`
+            exactly, the prior behaviour). Requires `model.encoder.layer` -- true of
+            RobertaModel and most HF encoder classes; raises otherwise rather than
+            silently leaving the whole encoder frozen. On Talk2Event, both encoders
+            frozen measured caption delta +0.0009 while unfreezing the VISION side alone
+            gave +0.051 in two epochs -- the text side has never been tested this way, so
+            this is an open hypothesis, not a repeat of an established result.
     """
 
     def __init__(self, model_name: str = TOKENIZER_NAME, d_model: int = 256,
-                 freeze: bool = True):
+                 freeze: bool = True, unfreeze_last: int = 0):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_name)
         self.proj = nn.Linear(self.encoder.config.hidden_size, d_model)
         self.d_model = d_model
-        self.frozen = freeze
+        self.unfreeze_last = unfreeze_last
+        # frozen: forward() runs the WHOLE encoder under no_grad, so no per-parameter
+        # requires_grad matters. partial: forward() runs under enable_grad, and only the
+        # last N layers (given requires_grad=True below) actually accumulate gradient --
+        # the rest sit at requires_grad=False and get none, despite the relaxed context.
+        self.frozen = freeze and unfreeze_last == 0
+        self.partial = freeze and unfreeze_last > 0
         if freeze:
             self.encoder.requires_grad_(False)
+            if unfreeze_last > 0:
+                if not hasattr(self.encoder, "encoder") or not hasattr(
+                        self.encoder.encoder, "layer"):
+                    raise ValueError(
+                        f"{model_name} has no `.encoder.layer` -- unfreeze_last needs "
+                        "a standard HF encoder stack (RobertaModel, BertModel, ...)")
+                layers = self.encoder.encoder.layer
+                if unfreeze_last > len(layers):
+                    raise ValueError(f"unfreeze_last={unfreeze_last} exceeds the "
+                                     f"{len(layers)} layers {model_name} has")
+                for layer in layers[-unfreeze_last:]:
+                    layer.requires_grad_(True)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -76,6 +101,11 @@ class TextEmbedder(nn.Module):
             # eval() also disables the encoder's dropout, which otherwise makes the text
             # features nondeterministic and any train-mode comparison meaningless
             self.encoder.eval()
+        elif self.partial:
+            # dropout stays active in the unfrozen tail, same as every other trainable
+            # module in this model -- only the frozen prefix layers' PARAMETERS are held
+            # fixed, not their forward behaviour
+            self.encoder.train(mode)
         return self
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
