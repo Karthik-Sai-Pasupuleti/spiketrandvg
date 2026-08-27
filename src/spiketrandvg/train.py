@@ -256,6 +256,10 @@ def main() -> None:
                           "it starts as exactly the unmodified model. This is the only "
                           "path by which the analog attention map reaches the box head "
                           "without first being binarised by proj_lif")
+    t2e.add_argument("--map-weight", type=float, default=0.0,
+                     help="weight on -log(attention mass inside the true box). Nothing "
+                          "else supervises WHERE the map points: the box loss reaches "
+                          "it only through proj_lif, which is binary. 0 disables")
     t2e.add_argument("--attn-prior-gain", type=float, default=0.0,
                      help="initial value of the learnable prior gain. 0.0 starts at "
                           "exactly the unmodified model; a positive value warm-starts "
@@ -667,7 +671,7 @@ def main_t2e(args) -> None:
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
         pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
         attn_prior=args.attn_prior, attn_prior_gain=args.attn_prior_gain,
-        pos_ratio=args.pos_ratio,
+        pos_ratio=args.pos_ratio, return_map=args.map_weight > 0,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
@@ -742,6 +746,12 @@ def main_t2e(args) -> None:
             # it is kept as a real class so the tagger learns what is NOT an attribute
             tag_ce = F.cross_entropy(o["tag_logits"].float().transpose(1, 2), lab)
             loss = box_loss + args.slot_weight * slot_ce + args.tag_weight * tag_ce
+            if args.map_weight > 0:
+                mass = model.attn_box_mass(o["attn"], gt)
+                map_nll = -(mass.clamp_min(1e-8)).log().mean()
+                loss = loss + args.map_weight * map_nll
+                run["map"] += float(map_nll) * gt.shape[0]
+                run["mass"] += float(mass.mean()) * gt.shape[0]
             (loss / args.accum).backward()
 
             if (it + 1) % args.accum == 0:
@@ -775,7 +785,9 @@ def main_t2e(args) -> None:
 
         print(f"EPOCH {epoch:3d} | loss {run['loss']/seen:6.3f} (box {run['box']/seen:.3f} "
               f"slot {run['slot']/seen:.3f} tag {run['tag']/seen:.3f}) "
-              f"train-IoU {run['iou']/seen:.3f} (mode gap {gap:+.4f}) | "
+              + (f"map {run['map']/seen:.3f} mass {run['mass']/seen:.3f} "
+                 if args.map_weight > 0 else "")
+              + f"train-IoU {run['iou']/seen:.3f} (mode gap {gap:+.4f}) | "
               f"mIoU {m['mIoU']:.4f}  Acc@0.25 {m['Acc@0.25']:.4f}  Acc@0.5 {m['Acc@0.5']:.4f}  "
               f"Acc@0.75 {m['Acc@0.75']:.4f}  Acc@0.9 {m['Acc@0.9']:.4f}"
               + (f" | blind {blind['mIoU']:.4f} delta {delta:+.4f}" if blind else "")

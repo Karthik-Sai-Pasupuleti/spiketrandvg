@@ -730,6 +730,7 @@ class Talk2EventGrounding(nn.Module):
         attn_prior: bool = False,
         attn_prior_gain: float = 0.0,
         pos_ratio: float | None = None,
+        return_map: bool = False,
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -813,6 +814,9 @@ class Talk2EventGrounding(nn.Module):
         # its amplitude stays pinned. Without that the optimiser can shrink the table and
         # the rescale silently undoes the shrink, which is a fight, not a control.
         self.pos_ratio = pos_ratio
+        # hand the last block's attention map back to the trainer, so it can be
+        # supervised directly (see `attn_box_mass`)
+        self.return_map = return_map
 
     def _revive_attention_bn(self, gain: float) -> None:
         """tdBN-style init on the cross-attention BatchNorms. NOT optional here.
@@ -864,6 +868,43 @@ class Talk2EventGrounding(nn.Module):
         for m in self.modules():
             if isinstance(m, sj_neuron.BaseNode):
                 m.reset()
+
+    def attn_box_mass(self, attn: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
+        """Fraction of the attention map's mass that lands inside the true box. (B,)
+
+        The map is the only tensor in this model indexed by spatial position, and
+        NOTHING currently supervises where it points. The box loss reaches it only
+        through `attn @ v -> proj_lif`, which is binary, so the gradient that survives
+        says almost nothing about location. `-log(mass in box)` is the direct statement
+        of the label we already have: the referent is HERE.
+
+        A cell counts as inside if its centre is inside the box, plus the cell
+        containing the box centre unconditionally -- a box narrower than one cell
+        (the 10th percentile object is 38 px against a 16 px s16 cell) can otherwise
+        contain no cell centre at all and give -log(0).
+        """
+        a = attn.float().mean(dim=(0, 2, 3))                    # (B,N) over T, h, Lq
+        cx, cy, w_, h_ = box.unbind(-1)
+        x0, x1 = cx - w_ / 2, cx + w_ / 2
+        y0, y1 = cy - h_ / 2, cy + h_ / 2
+        mass, off = a.new_zeros(a.shape[0]), 0
+        for t in self.taps:
+            gh = self.img_size[0] // self.events.strides[t]
+            gw = self.img_size[1] // self.events.strides[t]
+            m = a[:, off:off + gh * gw].view(-1, gh, gw)
+            off += gh * gw
+            xs = (torch.arange(gw, device=a.device, dtype=a.dtype) + 0.5) / gw
+            ys = (torch.arange(gh, device=a.device, dtype=a.dtype) + 0.5) / gh
+            inx = (xs[None] >= x0[:, None]) & (xs[None] <= x1[:, None])      # (B,gw)
+            iny = (ys[None] >= y0[:, None]) & (ys[None] <= y1[:, None])      # (B,gh)
+            # the cell holding the centre, so the mask is never empty
+            ci = (cx * gw).long().clamp(0, gw - 1)
+            ri = (cy * gh).long().clamp(0, gh - 1)
+            inx = inx.clone(); inx[torch.arange(len(ci), device=a.device), ci] = True
+            iny = iny.clone(); iny[torch.arange(len(ri), device=a.device), ri] = True
+            mask = (iny[:, :, None] & inx[:, None, :]).to(a.dtype)           # (B,gh,gw)
+            mass = mass + (m * mask).sum(dim=(1, 2))
+        return mass
 
     def _attn_position_prior(self, attn: torch.Tensor) -> torch.Tensor:
         """(T,B,h,Lq,N) attention map -> (B,2,V) log-density over the cx/cy slot grids.
@@ -960,7 +1001,7 @@ class Talk2EventGrounding(nn.Module):
         q = self.q_norm(queries).unsqueeze(0)                   # (1,B,4,d)
         v = self.v_norm(vis).unsqueeze(0)                       # (1,B,N,d)
         attn = None
-        need_attn = self.collect_stats or self.attn_prior
+        need_attn = self.collect_stats or self.attn_prior or self.return_map
         for i, blk in enumerate(self.blocks):
             if need_attn and i == len(self.blocks) - 1:
                 q, attn = blk(q, v, return_attn=True)
@@ -987,7 +1028,10 @@ class Talk2EventGrounding(nn.Module):
         pooled = self.head_norm(q.mean(dim=1))                  # (B,d)
         prior = self._attn_position_prior(attn) if self.attn_prior else None
         box, slot_logits = self.box_head(pooled, prior=prior)
-        return {"box": box, "slot_logits": slot_logits, "tag_logits": tag_logits}
+        out = {"box": box, "slot_logits": slot_logits, "tag_logits": tag_logits}
+        if self.return_map:
+            out["attn"] = attn
+        return out
 
     @torch.no_grad()
     def predict(self, cube, input_ids, attention_mask, amp: bool = True):
