@@ -148,14 +148,30 @@ class SpatialCrossAttention(nn.Module):
     able to localise, and it is one matmul, not the bulk of the compute.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, attn_drop: float = 0.0):
+    def __init__(self, dim: int, num_heads: int = 8, attn_drop: float = 0.0,
+                 scale: float | None = None):
         super().__init__()
         if dim % num_heads:
             raise ValueError(f"dim {dim} not divisible by num_heads {num_heads}")
         cmsf = forks.load_cmsf()
         self.h = num_heads
         self.dh = dim // num_heads
-        self.scale = self.dh ** -0.5
+        # Softmax temperature. `dh ** -0.5` is the transformer default and it is derived
+        # for ANALOG q/k: unit-variance Gaussian entries make q.k have variance dh, so
+        # dividing by sqrt(dh) restores an O(1) logit spread. Here q and k are BINARY,
+        # and the derivation gives the wrong answer by more than an order of magnitude.
+        #
+        # MEASURED on this model at init (480x640, taps s8+s16, N=6000 keys): q fires at
+        # 12.3%, k at 14.5%. Per head, q.k is a sum of dh=32 Bernoulli(0.123*0.145)
+        # terms, so it has mean 0.57 and standard deviation 0.75 counts. At the default
+        # scale that is a logit spread of 0.13 -- and a softmax over 6000 keys whose
+        # logits differ by 0.13 IS uniform. Predicted perplexity N*exp(-sigma^2) = 5896;
+        # measured 5980 of 6000. The near-uniform attention map is not a training
+        # failure or an initialisation accident, it is arithmetic.
+        #
+        # Sharpening needs a logit spread of order log(N) ~ 8.7, i.e. a scale tens of
+        # times larger. `scale` overrides the default for exactly that experiment.
+        self.scale = self.dh ** -0.5 if scale is None else float(scale)
 
         self.q_linear, self.k_linear, self.v_linear = (nn.Linear(dim, dim) for _ in range(3))
         self.q_bn, self.k_bn, self.v_bn = (nn.BatchNorm1d(dim) for _ in range(3))
@@ -222,10 +238,11 @@ class SpatialCrossAttention(nn.Module):
 class SpatialBlock(nn.Module):
     """SpatialCrossAttention + CMSF's spiking gated MLP, residual."""
 
-    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 2.0):
+    def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 2.0,
+                 attn_scale: float | None = None):
         super().__init__()
         cmsf = forks.load_cmsf()
-        self.attn = SpatialCrossAttention(dim, num_heads)
+        self.attn = SpatialCrossAttention(dim, num_heads, scale=attn_scale)
         with forks.allow_cupy_construction():
             self.mlp = cmsf.Spiking_GFNN(dim=dim, hidden_dim=int(dim * mlp_ratio))
         forks.use_torch_backend(self)
@@ -661,6 +678,7 @@ class Talk2EventGrounding(nn.Module):
         attn_bn_gain: float = 3.0,
         event_backbone: str = "spiliformer_dvs",
         pos_std: float = 0.02,
+        attn_scale: float | None = None,
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -704,7 +722,8 @@ class Talk2EventGrounding(nn.Module):
         # the head still cross-attends -- conditioning the encoder ADDS a pathway, it
         # does not replace this one
         self.blocks = nn.ModuleList(
-            [SpatialBlock(d_model, num_heads, mlp_ratio) for _ in range(depth)])
+            [SpatialBlock(d_model, num_heads, mlp_ratio, attn_scale=attn_scale)
+             for _ in range(depth)])
         self._revive_attention_bn(attn_bn_gain)
         self.q_norm = nn.LayerNorm(d_model)
         self.v_norm = nn.LayerNorm(d_model)
