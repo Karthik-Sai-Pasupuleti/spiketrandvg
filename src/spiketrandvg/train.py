@@ -597,7 +597,14 @@ def evaluate_t2e(model, loader, device, amp_ctx, keep: list[bool] | None = None,
             ious.append(i.cpu())
             if stats:
                 b = float(gt.shape[0])
-                for k, v in model.stats.items():
+                st = dict(model.stats)
+                if "attn" in out:
+                    # THE localisation indicator: what fraction of the attention map's
+                    # mass lands inside the true box. A uniform map scores the box's own
+                    # area fraction, ~0.011 here, and that is the number to beat before
+                    # anything downstream can read a position off the map.
+                    st["box_mass"] = model.attn_box_mass(out["attn"], gt).mean()
+                for k, v in st.items():
                     acc[k] = acc.get(k, torch.zeros((), device=v.device)) + v.float() * b
             if keep is not None:
                 flags.extend(keep[seen:seen + len(i)])
@@ -726,7 +733,7 @@ def main_t2e(args) -> None:
         (out / "log.tsv").write_text(
             "epoch\tstep\tloss\tbox\tslot\ttag\ttrain_iou\ttrain_mIoU\tlr\tmIoU\tAcc@0.25\t"
             "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tperplex\tn_keys\tpos_rms\t"
-            "q_rate\tk_rate\tlogit_sd\tsec\n")
+            "q_rate\tk_rate\tlogit_sd\tbox_mass\tsec\n")
 
     t0, stop = time.time(), False
     for epoch in range(start_epoch, args.epochs):
@@ -793,7 +800,8 @@ def main_t2e(args) -> None:
               + (f" | blind {blind['mIoU']:.4f} delta {delta:+.4f}" if blind else "")
               + f" | perplex {m.get('attn_perplexity', float('nan')):.1f}"
                 f"/{m.get('n_keys', float('nan')):.0f} "
-                f"pos_rms {m.get('pos_rms_ratio', float('nan')):.4f}"
+                f"pos_rms {m.get('pos_rms_ratio', float('nan')):.4f} "
+                f"box_mass {m.get('box_mass', float('nan')):.4f}"
               + f" | {(time.time()-t0)/60:.1f} min "
                 f"{torch.cuda.max_memory_allocated()/2**30:.1f} GiB", flush=True)
 
@@ -808,7 +816,8 @@ def main_t2e(args) -> None:
                     f"{m.get('pos_rms_ratio', float('nan')):.5f}\t"
                     f"{m.get('q_rate', float('nan')):.4f}\t"
                     f"{m.get('k_rate', float('nan')):.4f}\t"
-                    f"{m.get('logit_std', float('nan')):.3f}\t{int(time.time()-t0)}\n")
+                    f"{m.get('logit_std', float('nan')):.3f}\t"
+                    f"{m.get('box_mass', float('nan')):.5f}\t{int(time.time()-t0)}\n")
 
         blob = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch,
                 "gstep": gstep, "args": vars(args), "metrics": m}

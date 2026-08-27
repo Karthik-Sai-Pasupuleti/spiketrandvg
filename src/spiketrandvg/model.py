@@ -1029,7 +1029,7 @@ class Talk2EventGrounding(nn.Module):
         prior = self._attn_position_prior(attn) if self.attn_prior else None
         box, slot_logits = self.box_head(pooled, prior=prior)
         out = {"box": box, "slot_logits": slot_logits, "tag_logits": tag_logits}
-        if self.return_map:
+        if self.return_map or self.collect_stats:
             out["attn"] = attn
         return out
 
