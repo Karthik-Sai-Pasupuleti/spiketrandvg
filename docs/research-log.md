@@ -628,6 +628,11 @@ for the reason in section 14. Ladder: `acc75` (margin 0.002), else `acc50` (0.00
 | **`probe_02`** | **B** | **`--qk-lif ilif`** | **0.0055** | **0.1257** | **0.2367** | **+0.1544** | 478 | 0.0202 | **keep** |
 | **`probe_03`** | **A** | **`--pos-ratio 0.5`** | **0.0059** | **0.1345** | **0.2366** | **+0.1669** | 5142 | 0.5000 | **keep** |
 | **`probe_04`** | **B** | **`--map-weight 1.0`** | **0.0105** | **0.1474** | **0.2510** | **+0.1693** | **12** | 0.0849 | **keep** |
+| `probe_05` | B | + `--attn-scale 4.0` | 0.0029 | 0.1038 | 0.2184 | +0.1418 | 5 | 0.0235 | discard |
+| **`probe_06`** | **B** | **+ `--attn-prior`** | **0.0281** | **0.2205** | **0.2948** | **+0.1912** | 21 | 0.0729 | **keep** |
+| `probe_07` | C | + `--center-weight 4.0` | 0.0085 | 0.1447 | 0.2473 | +0.1636 | 13 | 0.0844 | discard |
+| **`probe_08`** | **A** | **+ `--pos-ratio 0.5`** | **0.0184** | **0.2061** | **0.2895** | **+0.1920** | 12 | 0.5000 | **keep** |
+| `probe_09` | B | `--map-weight 3.0` | 0.0064 | 0.1406 | 0.2384 | +0.1554 | 13 | 0.0931 | discard |
 
 `probe_02` takes the ladder at rung 2 (acc50 +0.0105 against a 0.004 margin), is the first
 change to move all four numbers the same way, and is stable rather than spiky over its
@@ -703,3 +708,56 @@ place requires position in the keys.
 
 Still improving at epoch 7 (acc50 0.1526, mIoU 0.2542, box_mass still climbing), so the
 8-epoch probe understates it. This is the promotion candidate.
+
+## 20. The map has to be aimed AND routed, and they are worth about the same
+
+`probe_04` fixed where the map points. It did not fix how the map reaches the box head:
+the only route was `attn @ v -> proj_lif`, which is binary, so a map that is now 39x
+better than chance still arrives as 256 bits.
+
+`probe_06` adds `--attn-prior`, which resamples the map's spatial marginals onto the slot
+grid and adds `gain * log p` to the cx/cy slot logits. Both changes are on top of the same
+`ilif` baseline, and each is worth roughly what the other is:
+
+| | acc75 | acc50 | mIoU | delta |
+|---|---|---|---|---|
+| `probe_02` `ilif` | 0.0055 | 0.1257 | 0.2367 | +0.1544 |
+| `probe_04` + aim the map (`--map-weight`) | 0.0105 | 0.1474 | 0.2510 | +0.1693 |
+| **`probe_06` + also route it (`--attn-prior`)** | **0.0281** | **0.2205** | **0.2948** | **+0.1912** |
+
+**acc75 is 7.4x the baseline and acc50 has nearly doubled**, at 8 SE on both. The
+zero-init gain settled at **0.794**, so the head adopted the map's opinion on its own --
+the chicken-and-egg worry (a zero gain gets no gradient until the map is useful, and the
+map gets no gradient until the gain is nonzero) resolved itself once `--map-weight` made
+the map useful first. Run in the other order it would have failed, and section 17's oracle
+is why: before supervision the map's centre was 110.7 px off against the head's own 46.0.
+
+### 20.1 `--attn-scale` is refuted, not a near-miss
+
+`probe_05` is `--map-weight 1.0 --attn-scale 4.0`, and it is **worse than `probe_04` on
+every metric** (acc50 0.1038 vs 0.1474, mIoU 0.2184 vs 0.2510, delta +0.1418 vs +0.1693).
+Perplexity 5 of 6000: the softmax has saturated, so almost no key receives gradient. A
+supervised map does not want more temperature -- `--map-weight` already concentrates it,
+and forcing it further starves the very mechanism being trained. Section 12 recorded this
+as a near-miss worth combining later; combined, it is a loss, and the record should say
+so.
+
+### 20.2 Lane A holds up on the new baseline
+
+`probe_08` re-runs `--pos-ratio 0.5` on top of `ilif + map-weight`, which is the check
+section 18.1 said was owed, because `probe_03` had been measured against the binary
+baseline. It survives: acc50 0.1474 -> 0.2061, mIoU 0.2510 -> 0.2895, delta +0.1920, and
+box_mass 39.1x -> 41.8x. So it is not an artefact of compensating for a weak binary code.
+
+`probe_06` and `probe_08` are separate additions to the same base and neither contains the
+other, so the combination is the obvious next probe.
+
+### 20.3 Two knobs that do not help
+
+`--center-weight 4.0` (`probe_07`) is slightly worse than not using it, even though the
+oracle in section 17 attributes essentially all remaining error to the centre. Knowing
+which coordinate is wrong does not mean reweighting its L1 term is how to fix it.
+
+`--map-weight 3.0` (`probe_09`) is worse than 1.0 on every accuracy metric while aiming
+the map very slightly better (41.1x vs 39.1x). The supervision is already doing its job at
+1.0 and the extra weight is spent against the box loss.
