@@ -627,6 +627,7 @@ for the reason in section 14. Ladder: `acc75` (margin 0.002), else `acc50` (0.00
 | `probe_01` | B | `--attn-scale 4.0` | 0.0032 | 0.1131 | 0.2312 | +0.1490 | 348 | 0.0195 | near-miss |
 | **`probe_02`** | **B** | **`--qk-lif ilif`** | **0.0055** | **0.1257** | **0.2367** | **+0.1544** | 478 | 0.0202 | **keep** |
 | **`probe_03`** | **A** | **`--pos-ratio 0.5`** | **0.0059** | **0.1345** | **0.2366** | **+0.1669** | 5142 | 0.5000 | **keep** |
+| **`probe_04`** | **B** | **`--map-weight 1.0`** | **0.0105** | **0.1474** | **0.2510** | **+0.1693** | **12** | 0.0849 | **keep** |
 
 `probe_02` takes the ladder at rung 2 (acc50 +0.0105 against a 0.004 margin), is the first
 change to move all four numbers the same way, and is stable rather than spiky over its
@@ -669,3 +670,36 @@ confirming on top of `ilif` before its default is flipped, and that confirmation
 also the new baseline every later probe is measured against. And `probe_03` was still
 improving at epoch 7 (acc50 0.1430 at epoch 6, mIoU 0.2414), so an 8-epoch probe probably
 understates it.
+
+## 19. Supervising where the map points is the change that works
+
+`probe_04` adds `-log(attention mass inside the true box)` to the loss, on top of the
+`--qk-lif ilif` baseline. It is the first result on this branch to beat the baseline by
+more than its own noise floor.
+
+| | acc75 | acc50 | mIoU | delta | perplexity | box_mass |
+|---|---|---|---|---|---|---|
+| `probe_00` baseline | 0.0038 | 0.1152 | 0.2319 | +0.1498 | 4967 | 1.19x |
+| `probe_02` `ilif` | 0.0055 | 0.1257 | 0.2367 | +0.1544 | 478 | 1.20x |
+| `probe_03` `pos-ratio` | 0.0059 | 0.1345 | 0.2366 | +0.1669 | 5142 | 1.28x |
+| **`probe_04` `map-weight 1.0`** | **0.0105** | **0.1474** | **0.2510** | **+0.1693** | **11.8** | **39.06x** |
+
+acc75 +0.0067 is **2.2 SE** against the 0.0030 floor of section 14 -- the first row here
+that is not inside its own error bar. acc50 +0.0322 is three times `probe_02`'s and 1.7x
+`probe_03`'s. `caption_delta` rose to +0.1693, so the gain is not a better blind detector.
+
+**box_mass rose monotonically over all eight epochs**: 20.8, 27.2, 30.7, 34.2, 36.3, 38.3,
+38.1, 39.06 times chance, and train-time mass reached 0.499 -- half the attention map
+inside the box. Perplexity fell to 11.8 of 6000, but the point is that it fell *while*
+box_mass rose. `probe_01` also collapsed the perplexity and drove box_mass to 0.97x
+chance; that is the distinction `box_mass_x` exists to make, and without it these two runs
+would look like the same kind of success.
+
+**An unrequested Lane A result.** `pos_rms_ratio` rose on its own from 0.035 to **0.0849**,
+crossing the README's 0.05 floor for the first time in any run here. Nothing asked it to.
+Supervising where the map points makes the encoder carry more positional signal as a
+by-product, which is independent evidence for the section 16 story: pointing at the right
+place requires position in the keys.
+
+Still improving at epoch 7 (acc50 0.1526, mIoU 0.2542, box_mass still climbing), so the
+8-epoch probe understates it. This is the promotion candidate.
