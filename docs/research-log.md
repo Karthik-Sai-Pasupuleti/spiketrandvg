@@ -439,3 +439,123 @@ initialised, so that is only literal if the head is pretrained too.
 * bf16 autocast throughout
 * Detection: batch 4 (~11–14 GiB). Grounding: batch 1 hard ceiling (17.1 GiB bf16; fp32
   OOMs)
+
+---
+
+# autoresearch run, 2026-08-27 (branch `autoresearch/20260827`)
+
+Event-only grounding on Talk2Event, hill-climbing `val_acc75` by changing the spiking
+vision encoder and the cross-attention module. Everything below is measured on this
+branch unless it says otherwise.
+
+## 10. Setup
+
+### 10.1 There was no validation split, and there is now
+
+`train.py` defaulted `--val-split` to `test` for `--task talk2event`, so early stopping
+AND best-checkpoint selection both ran on the test set. The previously reported mIoU
+0.2399 (`runs/t2e_100`) is a best-of-35 epochs selected on test, not a held-out number.
+
+`talk2event_val_sequences.txt` carves 8 of the 47 train sequences out as `val`, BY
+SEQUENCE, so no driving scene appears in both and val is a domain shift to unseen streets
+exactly as test is. **6535 train / 1140 val / 2555 test**, verified 0 shared sequences and
+0 shared frame paths. The rule that produced the list is in the file header; the file is
+frozen, because regenerating it would silently change what every recorded number means.
+
+The split behaves like test: the 8-epoch baseline reaches val mIoU 0.2359, against 0.2358
+at epoch 5 of the old test-selected run.
+
+### 10.2 Two leading indicators on the epoch line
+
+`attn_perplexity` (effective number of vision positions a query attends, out of 6000
+keys) and `pos_rms_ratio` (RMS(pos) / RMS(lateral output)), plus q/k firing rates and the
+logit spread in `log.tsv`. Collected in eval only, one device sync per call.
+
+## 11. The near-uniform attention map is arithmetic, not a training failure
+
+In `SpatialCrossAttention`, q and k each pass Linear -> BN -> `Dynamic_Threshold_LIFNode`,
+so they are **binary {0,1}** before the matmul, and the fusion runs at T=1. Per head,
+`q.k` is a sum of `dh=32` Bernoulli terms.
+
+Measured at init: q fires at 12.3%, k at 14.5%. So `q.k` has mean 0.57 and standard
+deviation 0.75 counts, and after `self.scale = dh**-0.5 = 0.177` the logits spread by
+**sigma = 0.13**. A softmax over N=6000 keys whose logits differ by 0.13 is the uniform
+distribution: predicted perplexity `N*exp(-sigma^2)` = 5896, **measured 5980 of 6000**.
+
+The consequence is not subtle. With a uniform map, `attn @ v` is the global average of all
+6000 vision tokens, and the positional table is zero-mean, so **its average contributes
+exactly nothing**. Position cannot reach `SlotBoxHead` at all. What the head sees is a
+caption vector plus a global scene descriptor, which is precisely the observed signature:
+mIoU 0.24 with caption_delta +0.15 (it does read the caption), and Acc@0.75 ~ 0 (there is
+no localisation mechanism to speak of).
+
+`dh**-0.5` is the right constant for ANALOG q/k -- unit-variance Gaussian entries make
+`q.k` have variance dh. For binary q/k the derivation is off by more than an order of
+magnitude.
+
+## 12. Temperature buys a 14x sharper map and nothing else
+
+`tools/temperature_response.py`, sweeping the scale on `probe_00/best.pth` over 570 val
+samples, then training at the chosen value.
+
+| scale | x default | logit sd | perplexity |
+|---|---|---|---|
+| 0.1768 | 1.0 | 0.53 | 4971.9 |
+| 1.0 | 5.7 | 3.06 | 1852.9 |
+| 4.0 | 22.6 | 12.01 | 681.0 |
+| 16.0 | 90.5 | — | 548.1 |
+| 32.0 | 181.0 | — | **548.1** |
+
+**Perplexity saturates at 548 of 6000 and does not move again.** Binary `q.k` is an
+integer overlap count, so at any large scale the softmax is a hard max over the ~548 keys
+TIED at the maximum count. That floor belongs to the binary code, not to the temperature.
+
+`probe_01` trained at scale 4.0 for 8 epochs. Perplexity 4967 -> 348, a 14x sharpening,
+and every accuracy number unchanged within noise (last-3-epoch means: acc75 0.0032 vs
+0.0038, acc50 0.1131 vs 0.1152, mIoU 0.2312 vs 0.2319, delta +0.1490 vs +0.1498).
+Recorded as a **near-miss**: the leading indicator moved by an order of magnitude and the
+metric did not, which localises the next question -- a sharper map is being thrown away
+downstream.
+
+## 13. Integer spikes break the tie floor
+
+`mem_update` (SpikeYOLO's I-LIF) is a real LIF with a soft reset that quantises to
+{0,1,2,3,4} instead of {0,1}. The event encoder already runs on it; the attention
+projections were the last place still binary. Same checkpoint, same 127 val samples:
+
+| q/k | scale | logit sd | perplexity |
+|---|---|---|---|
+| binary | 0.1768 | 0.53 | 4984.6 |
+| binary | 4.0 | 12.01 | 679.2 (floor 548) |
+| **I-LIF** | 0.1768 | 7.11 | 679.5 |
+| **I-LIF** | 0.3536 | 14.14 | 333.3 |
+| **I-LIF** | 1.0 | 39.58 | **123.3** |
+
+At the *same* scale the map is 7x sharper, at matched logit spread it is 2x sharper, and
+unlike the binary code it keeps sharpening past the floor. No analog path is added.
+
+## 14. `val_acc75` is not yet a usable ranking metric, and this has to be said out loud
+
+Acc@0.75 on this task is around 0.004, which on 1140 val samples is **4 to 5 samples**.
+The standard error of a between-run difference at that base rate is 0.0030 -- 3.4 samples
+-- so the protocol's 0.002 margin is **0.68 SE**, and picking the best of 8 epochs on it
+is selecting the maximum of eight noisy draws. probe_01's best-epoch acc75 of 0.0070
+against the baseline's 0.0044 looks like a win by the stated rule and is 0.9 SE.
+
+Every comparison on this branch is therefore reported as a **mean over the last 3
+epochs**, and until Acc@0.75 reaches a few percent the honest ranking signal is Acc@0.5
+(SE 0.013), mIoU, and the two leading indicators. Recording this rather than hill-climbing
+on it is the point.
+
+## 15. The slot grid is not the constraint; 6.7 px is
+
+Box statistics on the frozen splits (val, 1140 boxes): median width 67 px, median height
+50 px. IoU 0.75 on a box of side s allows a centre error of about 0.143*s per axis, so the
+**median centre tolerance is 6.7 px** and the 10th percentile is 4.6 px. At IoU 0.9 it is
+2.5 px.
+
+`--n-slots 1000` quantises to 0.32 px in x and 0.24 px in y, which caps IoU 0.75 only for
+boxes below about 2.2 px -- **0.00% of train, val and test**. The slot head is not what is
+limiting precision, and raising `--n-slots` would be wasted work. The stride-16 feature
+grid, at 16 px per cell against a 6.7 px tolerance, is a real constraint on any head that
+reads a cell index rather than a sub-cell expectation.
