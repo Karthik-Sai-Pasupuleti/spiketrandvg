@@ -71,9 +71,9 @@ import torch.nn.functional as F
 from spikingjelly.clock_driven import neuron as sj_neuron
 from torchvision.ops import box_iou, complete_box_iou_loss
 
-from spiketrandvg import forks
-from spiketrandvg.text_encoder import TextEncoder
-from spiketrandvg.vision_encoder import VisionEncoder
+from spiketrandvg import utils as forks
+from spiketrandvg.textencoder import TextEncoder
+from spiketrandvg.visionencoder import VisionEncoder
 
 __all__ = ["RefCOCOGrounding", "SpatialCrossAttention", "SpatialBlock", "SingleBoxLoss",
            "cxcywh_to_xyxy_norm", "build_model"]
@@ -642,8 +642,8 @@ class Talk2EventGrounding(nn.Module):
         attn_bn_gain: float = 3.0,
     ):
         super().__init__()
-        from spiketrandvg.event_encoder import EventEncoder, ThresholdModulator
-        from spiketrandvg.text_encoder import ATTRIBUTES, AttributeQueryTagger
+        from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
+        from spiketrandvg.textencoder import ATTRIBUTES, AttributeQueryTagger
 
         if img_size[0] % 16 or img_size[1] % 16:
             raise ValueError(f"img_size {img_size} must be divisible by 16")

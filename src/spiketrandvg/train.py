@@ -72,9 +72,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.ops import box_iou
 
-from spiketrandvg.dataset import RefCOCO, RefCOCOAugment, SPLITS, make_collate
+from spiketrandvg.dataloader import RefCOCO, RefCOCOAugment, SPLITS, make_collate
 from spiketrandvg.model import RefCOCOGrounding, SingleBoxLoss, cxcywh_to_xyxy_norm
-from spiketrandvg.text_encoder import build_tokenizer
+from spiketrandvg.textencoder import build_tokenizer
 
 IOU_THRESHOLDS = (0.25, 0.5, 0.75, 0.9)
 

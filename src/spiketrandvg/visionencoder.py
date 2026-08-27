@@ -1,58 +1,33 @@
-"""Language-conditioned spiking event encoder: Meta-SpikeFormer over event voxel cubes.
+"""Vision encoders: a spiking event encoder and a spiking RGB encoder.
 
-    forward(cube, gains) : (T,B,2,H,W) -> {tap: (T,B,C,H/s,W/s)}
+  `EventEncoder`   Meta-SpikeFormer over event voxel cubes. The main pathway for
+                   Talk2Event -- T=9 real timesteps, I-LIF integer activations, and
+                   firing thresholds modulated by language (`ThresholdModulator`).
 
-Three things distinguish this from a plain SpikeFormer wrapper, all of them from the
-Gate-2 design:
+  `VisionEncoder`  SpiLiFormer over an RGB frame. The main pathway for RefCOCO, and the
+                   branch a Talk2Event fusion row would use -- though for that row it
+                   should be an ANN rather than a spiking network, since the spiking
+                   claim concerns the event pathway where the sensor is.
 
-1. **T is a real temporal axis.** The cube carries T=9 genuine time bins of the event
-   stream, and LIF membranes evolve across them inside the multi-step kernels. This is
-   NOT nine stacked channels. The fork's own `forward()` would replicate one frame T
-   times, so it is never called -- `forward_features` is invoked directly.
-
-2. **I-LIF integer activations** (`--ilif`, default on). SpikeYOLO's `mem_update` is a
-   genuine LIF -- it integrates `mem = (mem_old - spike)*decay + x[t]` across the T axis
-   with a soft reset -- but its activation is `round(clamp(mem, 0, 4))` rather than a
-   binary threshold. A neuron therefore emits 0-4 per step instead of 0/1, carrying
-   ~2.3 bits instead of 1 while remaining multiplication-free downstream.
-
-3. **Language modulates firing thresholds** at stages 2-4 (`gains`). See
-   `ThresholdModulator` for why this is close to free at inference in a spiking network
-   and is not in an ANN.
-
-The accumulator
----------------
-`accumulate()` sums each neuron's spikes over the T axis: a neuron that fired 7 times
-out of 9 returns 7. **This is the hinge of the whole design.** Everything upstream is
-binary or small-integer and pays the precision cost the Gate-1 study measured; everything
-downstream of the accumulator is an ordinary real-valued tensor and an ordinary
-regression/classification problem. Confining the precision anxiety to one side of this
-line is the point.
-
-Why the taps are multi-scale, and why the input is not downsampled
-------------------------------------------------------------------
-Talk2Event boxes are small: median target ~62x66 px, ~1.3% of the frame. Downsampling
-throws that away before layer one, and a single stride-16 tap gives cells larger than the
-objects. At native 480x640:
-
-    stride  4 -> 120x160 (128 ch)    stride 16 -> 30x40 (512 ch, block3)
-    stride  8 ->  60x80 (256 ch)     stride 16 -> 30x40 (640 ch, block4)
-
-Taps are MEMBRANE potentials, not spikes -- each block returns its residual stream, which
-is analog. Downstream consumers open with their own neuron.
+Both return positional, projected tokens at a common width, so the fusion stack in
+`model.py` does not care which one produced them.
 """
 
 from __future__ import annotations
 
-import contextlib
 from functools import partial
-
-import torch
-import torch.nn as nn
 from spikingjelly.clock_driven import neuron as sj_neuron
 from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+import contextlib
+import torch
+import torch.nn as nn
 
-from spiketrandvg import forks
+from spiketrandvg import utils as forks
+
+
+# ====================================================================================
+# from event_encoder.py
+# ====================================================================================
 
 __all__ = ["EventEncoder", "ThresholdModulator", "TAPS", "DEFAULT_TAPS",
            "MODULATED_STAGES"]
@@ -363,3 +338,107 @@ class EventEncoder(nn.Module):
         a 7, and everything downstream is real-valued. See the module docstring.
         """
         return {k: v.sum(dim=0) for k, v in feats.items()}
+
+
+# ====================================================================================
+# from vision_encoder.py
+# ====================================================================================
+
+__all__ = ["VisionEncoder", "sj_reset"]
+
+
+def sj_reset(module: nn.Module) -> None:
+    """Zero every spikingjelly membrane inside `module` (never the caller itself).
+
+    Per-neuron rather than `spikingjelly.functional.reset_net`: that helper calls
+    `.reset()` on every submodule that has one, which includes any caller that defines
+    its own `reset`, and recurses until the stack blows.
+    """
+    for m in module.modules():
+        if isinstance(m, sj_neuron.BaseNode):
+            m.reset()
+
+
+class VisionEncoder(nn.Module):
+    """SpiLiFormer backbone + 1x1 lateral projection + learnable 2D positional embedding.
+
+    Args:
+        ckpt: SpiLiFormer ImageNet checkpoint. None starts from scratch, which wastes the
+            one pretrained visual prior available.
+        d_model: fusion width to project 768 backbone channels down to.
+        T_model: SpiLiFormer's own internal timesteps. The shipped checkpoint is T=4;
+            1 runs a single feature-extraction pass, which is cheaper but puts the
+            backbone's LIF layers outside the regime their weights were calibrated in.
+        max_hw: (H/16, W/16) for the input this model will see, so the positional table
+            is used directly instead of being interpolated on every forward call.
+        freeze: hold the backbone fixed.
+        pos_std: init std of the positional embedding -- see the module docstring.
+    """
+
+    def __init__(
+        self,
+        ckpt: str | None = None,
+        d_model: int = 256,
+        T_model: int = 1,
+        max_hw: tuple[int, int] = (24, 24),
+        freeze: bool = False,
+        pos_std: float = 0.02,
+    ):
+        super().__init__()
+        sl = forks.load_spiliformer()
+        with forks.allow_cupy_construction():
+            self.backbone = sl.SpiLiFormer_10_768(T=T_model)
+        forks.use_torch_backend(self.backbone)
+        self.T_model = T_model
+        self.report = {}
+        if ckpt:
+            blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+            sd = blob.get("model", blob)
+            msg = self.backbone.load_state_dict(sd, strict=False)
+            self.report = {"loaded": len(sd) - len(msg.unexpected_keys),
+                           "missing": len(msg.missing_keys),
+                           "unexpected": len(msg.unexpected_keys)}
+            print(f"[vision_encoder] SpiLiFormer from {ckpt}: "
+                  f"{self.report['loaded']}/{len(sd)} tensors "
+                  f"(missing {self.report['missing']}, unexpected {self.report['unexpected']})")
+        self.frozen = freeze
+        self.backbone.requires_grad_(not freeze)
+
+        self.lateral = nn.Conv2d(768, d_model, kernel_size=1)
+        self.pos = nn.Parameter(torch.zeros(1, d_model, *max_hw))
+        nn.init.trunc_normal_(self.pos, std=pos_std)
+        self.d_model = d_model
+        # RMS of the pre-position lateral output, refreshed every forward call; compared
+        # against RMS(pos) by tools/diagnose.py. See the module docstring.
+        self.last_lateral_rms: float | None = None
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.frozen:
+            self.backbone.eval()
+        return self
+
+    def forward(self, rgb: torch.Tensor, T_out: int) -> torch.Tensor:
+        if rgb.dim() != 4 or rgb.shape[1] != 3:
+            raise ValueError(f"expected (B, 3, H, W) rgb, got {tuple(rgb.shape)}")
+        # membranes persist across calls AND are shaped by the last input's resolution,
+        # so a reset is mandatory, not hygiene
+        sj_reset(self.backbone)
+        ctx = torch.no_grad() if self.frozen else contextlib.nullcontext()
+        with ctx:
+            x = rgb.unsqueeze(0).repeat(self.T_model, 1, 1, 1, 1)
+            feats, _tmp = self.backbone.forward_features(x)      # (Tm,B,768,H/16,W/16)
+        feats = feats.mean(0)                                    # collapse SpiLiFormer's T
+
+        B, C, H, W = feats.shape
+        y = self.lateral(feats)
+        self.last_lateral_rms = y.detach().float().pow(2).mean().sqrt().item()
+        pos = self.pos
+        if pos.shape[-2:] != (H, W):
+            pos = nn.functional.interpolate(pos, size=(H, W), mode="bilinear",
+                                            align_corners=False)
+        y = y + pos
+        # row-major: token index n = row * W + col. `model.py`'s soft-argmax head depends
+        # on this ordering to pair marginals with the right coordinate axis.
+        tok = y.reshape(B, self.d_model, H * W).permute(0, 2, 1)  # (B, N, d)
+        return tok.unsqueeze(0).expand(T_out, -1, -1, -1)         # (T_out, B, N, d)

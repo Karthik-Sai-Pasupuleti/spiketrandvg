@@ -45,9 +45,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from spiketrandvg.dataset import RefCOCO, SPLITS, make_collate
+from spiketrandvg.dataloader import RefCOCO, SPLITS, make_collate
 from spiketrandvg.model import RefCOCOGrounding
-from spiketrandvg.text_encoder import build_tokenizer
+from spiketrandvg.textencoder import build_tokenizer
 from spiketrandvg.train import (IOU_THRESHOLDS, _CaptionOverride, evaluate,
                                 hard_negative_captions)
 
