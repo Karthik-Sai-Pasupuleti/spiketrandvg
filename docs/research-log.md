@@ -626,6 +626,7 @@ for the reason in section 14. Ladder: `acc75` (margin 0.002), else `acc50` (0.00
 | `probe_00` | — | baseline | 0.0038 | 0.1152 | 0.2319 | +0.1498 | 4967 | 0.0353 | keep |
 | `probe_01` | B | `--attn-scale 4.0` | 0.0032 | 0.1131 | 0.2312 | +0.1490 | 348 | 0.0195 | near-miss |
 | **`probe_02`** | **B** | **`--qk-lif ilif`** | **0.0055** | **0.1257** | **0.2367** | **+0.1544** | 478 | 0.0202 | **keep** |
+| **`probe_03`** | **A** | **`--pos-ratio 0.5`** | **0.0059** | **0.1345** | **0.2366** | **+0.1669** | 5142 | 0.5000 | **keep** |
 
 `probe_02` takes the ladder at rung 2 (acc50 +0.0105 against a 0.004 margin), is the first
 change to move all four numbers the same way, and is stable rather than spiky over its
@@ -639,3 +640,32 @@ same way.
 leading indicator by 14x without moving the metric, and section 17 explains why -- a
 sharper map that points in the wrong place is not progress. It is worth re-testing on top
 of `--map-weight`, which is what `probe_05` does.
+
+### 18.1 The two wins are orthogonal, and that is the interesting part
+
+`probe_02` and `probe_03` are both single-variable wins over `probe_00`, and they do
+completely different things.
+
+|  | perplexity | box_mass | acc50 | caption_delta |
+|---|---|---|---|---|
+| `probe_00` baseline | 4967 | 1.19x chance | 0.1152 | +0.1498 |
+| `probe_02` `--qk-lif ilif` | **478** | 1.20x | 0.1257 | +0.1544 |
+| `probe_03` `--pos-ratio 0.5` | 5142 | **1.28x** | **0.1345** | **+0.1669** |
+
+`probe_02` makes the map ten times sharper and does not change where it points.
+`probe_03` does not sharpen it **at all** -- perplexity is 5142 against the baseline's
+4967 -- and instead improves where it points, and lifts caption sensitivity by more than
+anything else tried (+0.1669 against +0.1498).
+
+That fits section 16. The one caption cue carrying localisation is `relation_viewer`
+("on the left side of the road"), and a phrase like that can only be matched against a
+POSITIONAL signal in the keys. Pinning RMS(pos)/RMS(lateral) at 0.5, instead of letting it
+drift around 0.02-0.035, is what puts that signal there. Sharpening the map is a separate
+axis: it decides how finely a match can be localised once a match exists.
+
+Two cautions before this is treated as settled. `probe_03` was measured against the BINARY
+baseline, because it launched before `--qk-lif ilif` became the default -- so it needs
+confirming on top of `ilif` before its default is flipped, and that confirmation run is
+also the new baseline every later probe is measured against. And `probe_03` was still
+improving at epoch 7 (acc50 0.1430 at epoch 6, mIoU 0.2414), so an 8-epoch probe probably
+understates it.
