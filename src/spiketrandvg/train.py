@@ -239,6 +239,12 @@ def main() -> None:
     t2e.add_argument("--no-ilif", action="store_true",
                      help="keep binary LIF instead of integer I-LIF")
     t2e.add_argument("--freeze-event", action="store_true")
+    t2e.add_argument("--pos-ratio", type=float, default=None,
+                     help="pin RMS(pos) to this fraction of RMS(lateral) every forward. "
+                          "Default None keeps --pos-std's init and lets the ratio drift "
+                          "wherever training takes it (measured on probe_00: 0.039 -> "
+                          "0.018 -> 0.034 over 6 epochs). Below ~0.05 the positional "
+                          "signal is thresholded away before it can inform the map")
     t2e.add_argument("--attn-prior", action="store_true",
                      help="feed the attention map's spatial marginals to SlotBoxHead as "
                           "a learnable-gain log-prior on the cx/cy slots. Zero-init, so "
@@ -650,7 +656,7 @@ def main_t2e(args) -> None:
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
         pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
-        attn_prior=args.attn_prior,
+        attn_prior=args.attn_prior, pos_ratio=args.pos_ratio,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 

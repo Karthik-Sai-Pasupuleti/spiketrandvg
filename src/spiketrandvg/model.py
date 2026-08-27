@@ -728,6 +728,7 @@ class Talk2EventGrounding(nn.Module):
         attn_scale: float | None = None,
         qk_lif: str = "binary",
         attn_prior: bool = False,
+        pos_ratio: float | None = None,
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -798,6 +799,19 @@ class Talk2EventGrounding(nn.Module):
         self.attn_prior = attn_prior
         if attn_prior:
             self.attn_prior_gain = nn.Parameter(torch.zeros(1))
+
+        # Pin RMS(pos) to a fixed fraction of RMS(lateral) on every forward, instead of
+        # letting it be whatever a fixed init std happens to leave behind.
+        #
+        # MEASURED on probe_00, the ratio is not a constant and drifts on its own: 0.039
+        # at init, 0.018 after one epoch as the lateral output grows while the table sits
+        # still, 0.034 by epoch 5. `--pos-std` sets it only at step 0 and then loses
+        # control of it. Rescaling per forward makes it an actual hyperparameter.
+        #
+        # The scale factor is DETACHED, so gradient shapes the positional PATTERN while
+        # its amplitude stays pinned. Without that the optimiser can shrink the table and
+        # the rescale silently undoes the shrink, which is a fight, not a control.
+        self.pos_ratio = pos_ratio
 
     def _revive_attention_bn(self, gain: float) -> None:
         """tdBN-style init on the cross-attention BatchNorms. NOT optional here.
@@ -927,6 +941,10 @@ class Talk2EventGrounding(nn.Module):
             if pos.shape[-2:] != x.shape[-2:]:
                 pos = nn.functional.interpolate(pos, size=x.shape[-2:],
                                                 mode="bilinear", align_corners=False)
+            if self.pos_ratio is not None:
+                lat_rms = x.detach().float().pow(2).mean().sqrt()
+                pos_rms = pos.detach().float().pow(2).mean().sqrt().clamp_min(1e-12)
+                pos = pos * (self.pos_ratio * lat_rms / pos_rms).to(pos.dtype)
             if self.collect_stats:
                 # measured BEFORE the addition -- the ratio of the two is the question
                 lat_ms.append(x.detach().float().pow(2).mean())
