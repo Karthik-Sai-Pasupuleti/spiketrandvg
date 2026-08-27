@@ -89,6 +89,16 @@ def main() -> None:
     report("MAP centre + pred size", torch.cat([MC, P[:, 2:]], -1), G)
     report("MAP argmax + pred size", torch.cat([MA, P[:, 2:]], -1), G)
     report("MAP centre + TRUE size", torch.cat([MC, G[:, 2:]], -1), G)
+    # cx and cy are not symmetric on this data: gt cy has std 0.046 against cx's 0.231,
+    # because objects in driving scenes sit in a band around the horizon. Splitting the
+    # centre oracle says which of the two the effort belongs on.
+    print()
+    report("TRUE cx only", torch.cat([G[:, :1], P[:, 1:]], -1), G)
+    report("TRUE cy only", torch.cat([P[:, :1], G[:, 1:2], P[:, 2:]], -1), G)
+    ex = (P[:, 0] - G[:, 0]).abs() * 640
+    ey = (P[:, 1] - G[:, 1]).abs() * 480
+    print(f"\n  |cx| error px median {ex.median():.1f}   |cy| error px median "
+          f"{ey.median():.1f}   (gt std: cx {G[:, 0].std():.3f}, cy {G[:, 1].std():.3f})")
     d = (P[:, :2] - G[:, :2]).abs().mul(torch.tensor([640., 480.])).norm(dim=-1)
     dm = (MC - G[:, :2]).abs().mul(torch.tensor([640., 480.])).norm(dim=-1)
     print(f"\n  centre error px: model median {d.median():.1f}, map median {dm.median():.1f}"
