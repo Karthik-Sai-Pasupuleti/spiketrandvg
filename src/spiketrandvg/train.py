@@ -72,8 +72,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.ops import box_iou
 
-from spiketrandvg.dataloader import RefCOCO, RefCOCOAugment, SPLITS, make_collate
-from spiketrandvg.model import RefCOCOGrounding, SingleBoxLoss, cxcywh_to_xyxy_norm
+import torch.nn.functional as F
+
+from spiketrandvg.dataloader import (NO_ATTR, RefCOCO, RefCOCOAugment, SPLITS, Talk2Event,
+                                     make_collate, make_t2e_collate)
+from spiketrandvg.model import (RefCOCOGrounding, SingleBoxLoss, Talk2EventGrounding,
+                                cxcywh_to_xyxy_norm)
 from spiketrandvg.textencoder import build_tokenizer
 
 IOU_THRESHOLDS = (0.25, 0.5, 0.75, 0.9)
@@ -150,6 +154,9 @@ def evaluate(model, loader, device, amp_ctx, keep: list[bool] | None = None):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--task", default="refcoco", choices=["refcoco", "talk2event"],
+                    help="refcoco: RGB referring expressions (RefCOCOGrounding). "
+                         "talk2event: event streams (Talk2EventGrounding)")
     ap.add_argument("--run-name", default="refcoco")
     ap.add_argument("--dataset", default="refcoco", choices=sorted(SPLITS))
     ap.add_argument("--val-split", default="val")
@@ -208,7 +215,44 @@ def main() -> None:
     ap.add_argument("--max-iters", type=int, default=None, help="smoke test")
     ap.add_argument("--limit-train", type=int, default=None)
     ap.add_argument("--resume", default=None)
+
+    # --- talk2event only ---------------------------------------------------------
+    t2e = ap.add_argument_group("talk2event")
+    t2e.add_argument("--event-backbone", default="spiliformer_dvs",
+                     choices=["spiliformer_dvs", "metaspikformer"],
+                     help="spiliformer_dvs: 1.70M, event-native, no pretrained weights. "
+                          "metaspikformer: 54.71M, ImageNet-pretrained, adapted stem")
+    t2e.add_argument("--event-ckpt", default="",
+                     help="checkpoint for the event backbone; only metaspikformer has one")
+    t2e.add_argument("--n-slots", type=int, default=1000,
+                     help="SlotBoxHead bins per coordinate, over the annotation frame")
+    t2e.add_argument("--slot-weight", type=float, default=1.0,
+                     help="cross-entropy on the true slot; 0 leaves only the soft "
+                          "expectation gradient the box loss provides")
+    t2e.add_argument("--tag-weight", type=float, default=0.5,
+                     help="cross-entropy on the attribute span labels; 0 lets the tagger "
+                          "learn any partition, which is a valid ablation but is no "
+                          "longer 'the four attributes'")
+    t2e.add_argument("--no-condition", action="store_true",
+                     help="disable ThresholdModulator -- the language-blind-encoder "
+                          "ablation the conditioned model is measured against")
+    t2e.add_argument("--no-ilif", action="store_true",
+                     help="keep binary LIF instead of integer I-LIF")
+    t2e.add_argument("--freeze-event", action="store_true")
+
     args = ap.parse_args()
+
+    if args.task == "talk2event":
+        # Talk2Event's own defaults differ from RefCOCO's, and argparse cannot express
+        # "default depends on another flag". Only override values the user left at the
+        # RefCOCO default, so an explicit flag always wins.
+        d = ap.parse_args([])                       # what the defaults would have been
+        if args.size == d.size:       args.size = (480, 640)
+        if args.T == d.T:             args.T = 5
+        if args.val_split == d.val_split:   args.val_split = "test"
+        if args.run_name == d.run_name:     args.run_name = "talk2event"
+        if args.batch_size == d.batch_size: args.batch_size = 4
+        return main_t2e(args)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out = Path("runs") / args.run_name
@@ -426,6 +470,304 @@ def main() -> None:
                            for k, v in m.items() if not k.startswith("_")), flush=True)
     (out / "final_metrics.json").write_text(json.dumps(m, indent=1))
     print(f"done in {(time.time()-t0)/60:.1f} min | best val mIoU {best:.4f}")
+
+
+
+
+# ======================================================================================
+# Talk2Event
+# ======================================================================================
+
+def t2e_hard_negatives(ds: Talk2Event, seed: int = 0) -> tuple[list[str], list[bool]]:
+    """A caption naming a DIFFERENT object in the SAME event frame, per sample.
+
+    Same reasoning as `hard_negative_captions` for RefCOCO, and the same trap: Talk2Event
+    gives each object several paraphrases, so any position-based shuffle would score
+    paraphrases as negatives and collapse the delta toward zero. The negative is chosen by
+    OBJECT IDENTITY -- `(event_path, bbox)` -- never by index.
+
+    `is_hard[i]` is False where the frame held no other object; those fall back to a
+    different frame and are excluded from the headline delta, since rejecting a caption
+    from another scene needs no grounding at all.
+    """
+    rng = random.Random(seed)
+    recs = ds.items
+    okey = lambda r: (r["event_path"], r["bbox"]["x"], r["bbox"]["y"],
+                      r["bbox"]["w"], r["bbox"]["h"])
+    obj = [okey(r) for r in recs]
+    caps = [ds._caption_and_attrs(r, i)[0] for i, r in enumerate(recs)]
+    by_frame: dict[str, list[int]] = defaultdict(list)
+    for i, r in enumerate(recs):
+        by_frame[r["event_path"]].append(i)
+
+    neg, hard, n = [], [], len(recs)
+    for i, r in enumerate(recs):
+        sib = [j for j in by_frame[r["event_path"]] if obj[j] != obj[i]]
+        if sib:
+            neg.append(caps[rng.choice(sib)]); hard.append(True)
+        else:
+            j = rng.randrange(n)
+            while recs[j]["event_path"] == r["event_path"]:
+                j = rng.randrange(n)
+            neg.append(caps[j]); hard.append(False)
+    return neg, hard
+
+
+class _T2ECaptionOverride(Dataset):
+    """Same cubes and boxes, each paired with a supplied caption.
+
+    Attribute spans are emitted empty: they only feed the auxiliary tagger loss, which is
+    a training-time signal, and a span located in the ORIGINAL caption would be wrong for
+    the substituted one.
+    """
+
+    def __init__(self, ds: Talk2Event, captions: list[str]):
+        self.ds, self.captions = ds, captions
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        cube, _cap, box, _spans, rec = self.ds[i]
+        return cube, self.captions[i], box, [], rec
+
+
+@torch.no_grad()
+def evaluate_t2e(model, loader, device, amp_ctx, keep: list[bool] | None = None):
+    """mIoU and Acc@thresholds for Talk2EventGrounding (which returns a dict)."""
+    model.eval()
+    ious, flags, seen = [], [], 0
+    for cube, ids, mask, gt, _lab, _caps, _recs in loader:
+        cube, ids, mask, gt = (t.to(device, non_blocking=True)
+                               for t in (cube, ids, mask, gt))
+        with amp_ctx():
+            out = model(cube, ids, mask)
+        i = box_iou(cxcywh_to_xyxy_norm(out["box"].float()),
+                    cxcywh_to_xyxy_norm(gt)).diagonal()
+        ious.append(i.cpu())
+        if keep is not None:
+            flags.extend(keep[seen:seen + len(i)])
+        seen += len(i)
+    t = torch.cat(ious)
+    if keep is not None:
+        t = t[torch.tensor(flags, dtype=torch.bool)]
+    return {"n": len(t), "mIoU": t.mean().item(),
+            **{f"Acc@{th}": (t >= th).float().mean().item() for th in IOU_THRESHOLDS}}
+
+
+def slot_targets(box: torch.Tensor, n_slots: int) -> torch.Tensor:
+    """(B,4) normalised cxcywh -> (B,4) int64 slot indices for the cross-entropy.
+
+    The box loss already reaches `slot_logits` through the soft-argmax expectation, but
+    only as a diffuse signal: many distributions share a mean. A direct cross-entropy on
+    the slot that CONTAINS the true coordinate is the supervision the head's
+    "four multiple-choice questions" framing actually implies, and it is what makes the
+    argmax (rather than just the expectation) meaningful.
+    """
+    return (box.clamp(0, 1 - 1e-6) * n_slots).long().clamp(0, n_slots - 1)
+
+
+def main_t2e(args) -> None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    out = Path("runs") / args.run_name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "args.json").write_text(json.dumps(vars(args), indent=1))
+    amp_ctx = ((lambda: torch.autocast("cuda", dtype=torch.bfloat16))
+               if device == "cuda" else contextlib.nullcontext)
+
+    tokenizer = build_tokenizer()
+    collate = make_t2e_collate(tokenizer)
+    train_ds = Talk2Event("train", t_steps=args.T, limit=args.limit_train)
+    val_ds = Talk2Event(args.val_split, t_steps=args.T)
+    train_eval_ds = Talk2Event("train", t_steps=args.T, limit=args.limit_train)
+
+    neg_caps, is_hard = t2e_hard_negatives(val_ds)
+    blind_ds = _T2ECaptionOverride(val_ds, neg_caps)
+
+    idxs = (list(range(len(val_ds))) if not args.eval_samples else
+            list(range(0, len(val_ds), max(1, len(val_ds) // args.eval_samples))))
+    keep = [is_hard[i] for i in idxs]
+    tr_idxs = (list(range(len(train_eval_ds))) if not args.train_eval_samples else
+               list(range(0, len(train_eval_ds),
+                          max(1, len(train_eval_ds) // args.train_eval_samples))))
+
+    def loader(ds, shuffle=False, subset=None):
+        src = Subset(ds, subset) if subset is not None else ds
+        return DataLoader(src, batch_size=args.batch_size, shuffle=shuffle,
+                          num_workers=args.workers, collate_fn=collate, pin_memory=True,
+                          drop_last=shuffle, persistent_workers=args.workers > 0)
+
+    train_dl = loader(train_ds, shuffle=True)
+    val_dl, blind_dl = loader(val_ds, subset=idxs), loader(blind_ds, subset=idxs)
+    train_eval_dl = loader(train_eval_ds, subset=tr_idxs)
+
+    model = Talk2EventGrounding(
+        event_ckpt=args.event_ckpt or None, event_backbone=args.event_backbone,
+        text_model=args.text_model, img_size=tuple(args.size), T=args.T,
+        depth=args.depth, n_slots=args.n_slots, ilif=not args.no_ilif,
+        condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
+        freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
+    ).to(device)
+    crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
+
+    pretrained = list(model.events.backbone.parameters()) + \
+        list(model.text.encoder.parameters())
+    enc_ids = {id(p) for p in pretrained}
+    enc = [p for p in model.parameters() if p.requires_grad and id(p) in enc_ids]
+    new = [p for p in model.parameters() if p.requires_grad and id(p) not in enc_ids]
+    groups = [g for g in ({"params": enc, "lr": args.encoder_lr},
+                          {"params": new, "lr": args.lr}) if g["params"]]
+    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
+    base_lrs = [g["lr"] for g in opt.param_groups]
+
+    steps_per_epoch = max(1, len(train_dl) // args.accum)
+    total_steps = steps_per_epoch * args.epochs
+
+    def set_lr(step: int) -> float:
+        if step < args.warmup:
+            m = (step + 1) / max(1, args.warmup)
+        else:
+            p = (step - args.warmup) / max(1, total_steps - args.warmup)
+            m = 0.5 * (1 + math.cos(math.pi * min(1.0, p)))
+        for g, b in zip(opt.param_groups, base_lrs):
+            g["lr"] = b * m
+        return m
+
+    start_epoch, best, since_best, gstep = 0, -1.0, 0, 0
+    if args.resume:
+        blob = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(blob["model"]); opt.load_state_dict(blob["opt"])
+        start_epoch, best = blob["epoch"] + 1, blob.get("best", -1.0)
+        gstep = blob.get("gstep", start_epoch * steps_per_epoch)
+        print(f"resumed {args.resume} at epoch {start_epoch} (best mIoU {best:.4f})")
+
+    tp = model.trainable_parameters()
+    n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_all = sum(p.numel() for p in model.parameters())
+    print(f"device {device} | bf16 train AND eval | batch {args.batch_size} x accum {args.accum}")
+    print(f"talk2event: train {len(train_ds)} | {args.val_split} {len(val_ds)} "
+          f"(eval on {len(idxs)}, {sum(keep)} with a same-frame hard negative)")
+    print(f"events {args.event_backbone} | T {args.T} x 2ch | {args.size[0]}x{args.size[1]} "
+          f"| taps {model.taps} | slots {args.n_slots}")
+    print(f"conditioning {'OFF' if args.no_condition else 'ON'} "
+          f"({model.events.modulated_stages}) | ilif {not args.no_ilif} | "
+          f"event backbone {'FROZEN' if args.freeze_event else 'trainable'}")
+    print(f"loss = box + {args.slot_weight}*slotCE + {args.tag_weight}*tagCE")
+    print(f"trainable {n_tr/1e6:.2f}M of {n_all/1e6:.1f}M  " +
+          "  ".join(f"{k} {v/1e6:.2f}M" for k, v in tp.items()))
+    print(f"{steps_per_epoch} steps/epoch, {total_steps} total\n", flush=True)
+
+    if not (out / "log.tsv").exists():
+        (out / "log.tsv").write_text(
+            "epoch\tstep\tloss\tbox\tslot\ttag\ttrain_iou\ttrain_mIoU\tlr\tmIoU\tAcc@0.25\t"
+            "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tsec\n")
+
+    t0, stop = time.time(), False
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        run, seen = defaultdict(float), 0
+        opt.zero_grad(set_to_none=True)
+        for it, (cube, ids, mask, gt, lab, _c, _r) in enumerate(train_dl):
+            cube, ids, mask, gt, lab = (t.to(device, non_blocking=True)
+                                        for t in (cube, ids, mask, gt, lab))
+            with amp_ctx():
+                o = model(cube, ids, mask)
+            box_loss, parts = crit(o["box"].float(), gt)
+            slot_ce = F.cross_entropy(
+                o["slot_logits"].float().flatten(0, 1),
+                slot_targets(gt, args.n_slots).flatten(0, 1))
+            # ignore_index on the "no attribute" class would train only the positives;
+            # it is kept as a real class so the tagger learns what is NOT an attribute
+            tag_ce = F.cross_entropy(o["tag_logits"].float().transpose(1, 2), lab)
+            loss = box_loss + args.slot_weight * slot_ce + args.tag_weight * tag_ce
+            (loss / args.accum).backward()
+
+            if (it + 1) % args.accum == 0:
+                mult = set_lr(gstep)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], args.clip)
+                opt.step(); opt.zero_grad(set_to_none=True)
+                gstep += 1
+
+            b = gt.shape[0]; seen += b
+            run["loss"] += loss.item() * b; run["box"] += box_loss.item() * b
+            run["slot"] += slot_ce.item() * b; run["tag"] += tag_ce.item() * b
+            run["iou"] += float(parts["iou"]) * b
+
+            if args.log_every and (it + 1) % (args.log_every * args.accum) == 0:
+                print(f"  ep {epoch} step {gstep}/{total_steps}  loss {run['loss']/seen:6.3f} "
+                      f"(box {run['box']/seen:.3f} slot {run['slot']/seen:.3f} "
+                      f"tag {run['tag']/seen:.3f})  train-IoU {run['iou']/seen:.3f}  "
+                      f"lr x{mult:.3f}  {(time.time()-t0)/60:.1f} min", flush=True)
+            if args.max_iters and it + 1 >= args.max_iters:
+                break
+
+        m = evaluate_t2e(model, val_dl, device, amp_ctx)
+        train_m = evaluate_t2e(model, train_eval_dl, device, amp_ctx)
+        gap = train_m["mIoU"] - run["iou"] / seen
+        blind = (evaluate_t2e(model, blind_dl, device, amp_ctx, keep=keep)
+                 if args.blind_every and epoch % args.blind_every == 0 else None)
+        m_hard = (evaluate_t2e(model, val_dl, device, amp_ctx, keep=keep)
+                  if blind is not None else None)
+        delta = (m_hard["mIoU"] - blind["mIoU"]) if blind else float("nan")
+
+        print(f"EPOCH {epoch:3d} | loss {run['loss']/seen:6.3f} (box {run['box']/seen:.3f} "
+              f"slot {run['slot']/seen:.3f} tag {run['tag']/seen:.3f}) "
+              f"train-IoU {run['iou']/seen:.3f} (mode gap {gap:+.4f}) | "
+              f"mIoU {m['mIoU']:.4f}  Acc@0.25 {m['Acc@0.25']:.4f}  Acc@0.5 {m['Acc@0.5']:.4f}  "
+              f"Acc@0.75 {m['Acc@0.75']:.4f}  Acc@0.9 {m['Acc@0.9']:.4f}"
+              + (f" | blind {blind['mIoU']:.4f} delta {delta:+.4f}" if blind else "")
+              + f" | {(time.time()-t0)/60:.1f} min", flush=True)
+
+        with open(out / "log.tsv", "a") as f:
+            f.write(f"{epoch}\t{gstep}\t{run['loss']/seen:.4f}\t{run['box']/seen:.4f}\t"
+                    f"{run['slot']/seen:.4f}\t{run['tag']/seen:.4f}\t{run['iou']/seen:.4f}\t"
+                    f"{train_m['mIoU']:.4f}\t{mult:.4f}\t{m['mIoU']:.4f}\t"
+                    f"{m['Acc@0.25']:.4f}\t{m['Acc@0.5']:.4f}\t{m['Acc@0.75']:.4f}\t"
+                    f"{m['Acc@0.9']:.4f}\t{blind['mIoU'] if blind else float('nan'):.4f}\t"
+                    f"{delta:.4f}\t{int(time.time()-t0)}\n")
+
+        blob = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch,
+                "gstep": gstep, "args": vars(args), "metrics": m}
+        torch.save(blob, out / "last.pth")
+        if m["mIoU"] > best:
+            best, since_best = m["mIoU"], 0
+            blob["best"] = best
+            torch.save(blob, out / "best.pth")
+            print(f"         new best mIoU {best:.4f}", flush=True)
+            if args.keep_all_best:
+                snap = out / f"best_ep{epoch:03d}_miou{m['mIoU']:.4f}.pth"
+                torch.save({"model": model.state_dict(), "epoch": epoch,
+                            "args": vars(args), "metrics": m, "best": best}, snap)
+                print(f"         archived {snap.name}", flush=True)
+        else:
+            since_best += 1
+            if args.patience and since_best >= args.patience:
+                print(f"\nEARLY STOP: {since_best} epochs without improvement.", flush=True)
+                stop = True
+        if stop or args.max_iters:
+            break
+
+    ck = out / "best.pth"
+    if ck.exists():
+        model.load_state_dict(torch.load(ck, map_location=device,
+                                         weights_only=False)["model"])
+    print(f"\nfinal evaluation on all {len(val_ds)} {args.val_split} samples "
+          f"(best checkpoint)", flush=True)
+    full, full_blind = loader(val_ds), loader(blind_ds)
+    m = evaluate_t2e(model, full, device, amp_ctx)
+    b = evaluate_t2e(model, full_blind, device, amp_ctx, keep=is_hard)
+    m_hard = evaluate_t2e(model, full, device, amp_ctx, keep=is_hard)
+    m["blind_mIoU"] = b["mIoU"]
+    m["mIoU_on_hard_subset"] = m_hard["mIoU"]
+    m["caption_delta"] = m_hard["mIoU"] - b["mIoU"]
+    m["n_hard"] = int(sum(is_hard))
+    m["_delta_note"] = ("negatives are a caption for a DIFFERENT object in the SAME event "
+                        "frame; delta compares only the n_hard samples that have one")
+    print("  " + "  ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}"
+                           for k, v in m.items() if not k.startswith("_")), flush=True)
+    (out / "final_metrics.json").write_text(json.dumps(m, indent=1))
+    print(f"done in {(time.time()-t0)/60:.1f} min | best {args.val_split} mIoU {best:.4f}")
 
 
 if __name__ == "__main__":
