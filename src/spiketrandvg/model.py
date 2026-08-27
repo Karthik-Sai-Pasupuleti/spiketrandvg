@@ -730,6 +730,7 @@ class Talk2EventGrounding(nn.Module):
         attn_prior: bool = False,
         attn_prior_gain: float = 0.0,
         attn_prior_eps: float = 0.01,
+        query_weights: bool = False,
         pos_ratio: float | None = None,
         return_map: bool = False,
     ):
@@ -801,6 +802,9 @@ class Talk2EventGrounding(nn.Module):
         # backward it would kill.
         self.attn_prior = attn_prior
         self.attn_prior_eps = attn_prior_eps
+        # zero-init -> softmax -> uniform -> exactly the plain mean at step 0
+        self.query_logits = (nn.Parameter(torch.zeros(self.n_attr))
+                             if query_weights else None)
         if attn_prior:
             self.attn_prior_gain = nn.Parameter(torch.full((1,), attn_prior_gain))
 
@@ -871,6 +875,25 @@ class Talk2EventGrounding(nn.Module):
             if isinstance(m, sj_neuron.BaseNode):
                 m.reset()
 
+    def _pooled_map(self, attn: torch.Tensor) -> torch.Tensor:
+        """(T,B,h,Lq,N) -> (B,N), pooling T, heads and the four attribute queries.
+
+        The queries are not interchangeable. Section 16 of the research log measures the
+        caption reduced to one attribute group at a time: `relation_viewer` alone reaches
+        mIoU 0.1507 while `appearance` (0.0501) and `status` (0.0532) sit at the trivial
+        floor. Averaging the four maps equally therefore dilutes the one that knows where
+        the referent is with three that do not.
+
+        `query_logits` is zero-initialised, so the pooling starts as the plain mean and
+        any departure from it has to be earned. Both the supervision and the prior read
+        the map through here, so they always agree about what "the map" is.
+        """
+        a = attn.float().mean(dim=(0, 2))                        # (B,Lq,N) over T, heads
+        if self.query_logits is None:
+            return a.mean(1)
+        w = self.query_logits.softmax(0)[None, :a.shape[1], None]
+        return (a * w).sum(1) / w.sum(1).clamp_min(1e-8)
+
     def attn_box_mass(self, attn: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
         """Fraction of the attention map's mass that lands inside the true box. (B,)
 
@@ -885,7 +908,7 @@ class Talk2EventGrounding(nn.Module):
         (the 10th percentile object is 38 px against a 16 px s16 cell) can otherwise
         contain no cell centre at all and give -log(0).
         """
-        a = attn.float().mean(dim=(0, 2, 3))                    # (B,N) over T, h, Lq
+        a = self._pooled_map(attn)                              # (B,N)
         cx, cy, w_, h_ = box.unbind(-1)
         x0, x1 = cx - w_ / 2, cx + w_ / 2
         y0, y1 = cy - h_ / 2, cy + h_ / 2
@@ -930,7 +953,7 @@ class Talk2EventGrounding(nn.Module):
         rather than by how many bins they happen to have.
         """
         V = self.box_head.n_slots
-        a = attn.float().mean(dim=(0, 2, 3))                    # (B,N) over T, h, Lq
+        a = self._pooled_map(attn)                              # (B,N)
         px = a.new_zeros(a.shape[0], V)
         py = a.new_zeros(a.shape[0], V)
         off = 0
@@ -1034,6 +1057,10 @@ class Talk2EventGrounding(nn.Module):
             if self.attn_prior:
                 # a gain still at its init means the head never found the map useful
                 self.stats["prior_gain"] = self.attn_prior_gain.detach().squeeze()
+            if self.query_logits is not None:
+                w = self.query_logits.detach().softmax(0)
+                for i, nm in enumerate(("appear", "status", "viewer", "others")):
+                    self.stats[f"qw_{nm}"] = w[i]
 
         pooled = self.head_norm(q.mean(dim=1))                  # (B,d)
         prior = self._attn_position_prior(attn) if self.attn_prior else None

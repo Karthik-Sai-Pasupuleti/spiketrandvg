@@ -262,6 +262,12 @@ def main() -> None:
                           "it only through proj_lif, which is binary. DEFAULT since "
                           "probe_04; 0 is the ablation. Unlike the architecture flags "
                           "this one is training-only, so eval.py needs no counterpart")
+    t2e.add_argument("--query-weights", action="store_true",
+                     help="learn how much each of the four attribute sub-queries counts "
+                          "toward the pooled attention map. Zero-init, so it starts as "
+                          "the plain mean. Motivated by the per-attribute table: "
+                          "relation_viewer alone reaches mIoU 0.1507 while appearance "
+                          "and status sit at the 0.06 trivial floor")
     t2e.add_argument("--attn-prior-gain", type=float, default=0.0,
                      help="initial value of the learnable prior gain. 0.0 starts at "
                           "exactly the unmodified model; a positive value warm-starts "
@@ -692,6 +698,7 @@ def main_t2e(args) -> None:
         pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
         attn_prior=args.attn_prior, attn_prior_gain=args.attn_prior_gain,
         pos_ratio=args.pos_ratio, return_map=args.map_weight > 0,
+        query_weights=args.query_weights,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
