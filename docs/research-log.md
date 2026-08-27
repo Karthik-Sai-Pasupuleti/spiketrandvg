@@ -633,6 +633,7 @@ for the reason in section 14. Ladder: `acc75` (margin 0.002), else `acc50` (0.00
 | `probe_07` | C | + `--center-weight 4.0` | 0.0085 | 0.1447 | 0.2473 | +0.1636 | 13 | 0.0844 | discard |
 | **`probe_08`** | **A** | **+ `--pos-ratio 0.5`** | **0.0184** | **0.2061** | **0.2895** | **+0.1920** | 12 | 0.5000 | **keep** |
 | `probe_09` | B | `--map-weight 3.0` | 0.0064 | 0.1406 | 0.2384 | +0.1554 | 13 | 0.0931 | discard |
+| **`probe_10`** | **A+B** | **`--attn-prior --pos-ratio 0.5`** | **0.0325** | **0.2544** | **0.3090** | **+0.2113** | 11 | 0.5000 | **keep** |
 
 `probe_02` takes the ladder at rung 2 (acc50 +0.0105 against a 0.004 margin), is the first
 change to move all four numbers the same way, and is stable rather than spiky over its
@@ -779,3 +780,32 @@ branch introduced.
 The fusion's own q/k, switched to I-LIF in `probe_02`, sit at mean level 1.24-1.34 and
 41-46% nonzero -- in range, and using about a third of the amplitude the integer code
 makes available, which is what gives the logits their spread.
+
+## 22. The two fixes are additive
+
+`probe_10` runs `--attn-prior` and `--pos-ratio 0.5` together on the
+`ilif + map-weight 1.0` base. Neither contains the other -- one changes what the encoder
+puts in the keys, the other changes how the map reaches the box head -- and they add:
+
+| | acc75 | acc50 | mIoU | delta |
+|---|---|---|---|---|
+| `probe_04` base (`ilif + map1`) | 0.0105 | 0.1474 | 0.2510 | +0.1693 |
+| `probe_06` + `--attn-prior` | 0.0281 | 0.2205 | 0.2948 | +0.1912 |
+| `probe_08` + `--pos-ratio 0.5` | 0.0184 | 0.2061 | 0.2895 | +0.1920 |
+| **`probe_10` + both** | **0.0325** | **0.2544** | **0.3090** | **+0.2113** |
+
+On acc50 the two deltas are +0.0731 and +0.0587; together they deliver +0.1070 of a
+possible +0.1318, so slightly sub-additive but with both clearly contributing.
+
+Against the `probe_00` baseline: **acc75 8.6x, acc50 2.2x, mIoU +0.077, caption_delta
++0.1498 -> +0.2113**. The delta rising alongside the accuracy is the thing to keep
+checking -- the whole stack could have been a better blind detector and it is not.
+
+The run was still improving at epoch 7 (acc50 0.2667, mIoU 0.3146, box_mass still
+climbing), and its best-checkpoint full-val numbers are mIoU 0.3146, Acc@0.5 0.2667,
+Acc@0.75 0.0325, caption_delta 0.2148, learned prior gain 0.873. Eight epochs is a ranking
+budget, not a converged one, so this is the promotion candidate.
+
+For scale: the pre-existing `runs/t2e_100` reported mIoU 0.2399, but that was best-of-35
+selected ON TEST (section 10.1). The honest comparison is against `probe_00`'s 0.2319 on a
+split nothing has ever selected on.
