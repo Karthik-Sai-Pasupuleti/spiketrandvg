@@ -41,6 +41,20 @@ TAPS: dict[str, tuple[str, int, int]] = {
 }
 DEFAULT_TAPS = ("s8", "s16")
 
+# SpiLiFormer-DVS is a two-stage network, so its taps are different: patch_embed1 lands
+# at stride 8 (128 ch) and stage2 at stride 16 (256 ch). Verified at 480x640 -> 60x80
+# and 30x40. Only ONE genuine downsample separates them, so it is a shallower pyramid
+# than Meta-SpikeFormer's.
+DVS_TAPS: dict[str, tuple[str, int, int]] = {
+    "s8":  ("patch_embed1", 8, 128),
+    "s16": ("stage2", 16, 256),
+}
+_DVS_STAGE_ORDER: dict[str, int] = {"patch_embed1": 0, "stage1": 1,
+                                    "patch_embed2": 2, "stage2": 3}
+# stage2 is the only block worth conditioning: stage1 sits before the last downsample and
+# patch_embed* are plain convolution stacks.
+DVS_MODULATED_STAGES: tuple[str, ...] = ("stage2",)
+
 # Stages 2-4 take the language modulation. Stage 1 is deliberately excluded: it runs at
 # stride 4 over the full 120x160 grid (the most expensive place to add anything) and
 # encodes edges and polarity, which are not what a caption disambiguates.
@@ -136,16 +150,35 @@ class EventEncoder(nn.Module):
         in_channels: int = 2,
         ilif: bool = True,
         freeze: bool = False,
-        modulated_stages: tuple[str, ...] = MODULATED_STAGES,
+        modulated_stages: tuple[str, ...] | None = None,
+        backbone: str = "metaspikformer",
+        img_size: tuple[int, int] = (480, 640),
     ):
         super().__init__()
-        bad = set(taps) - set(TAPS)
+        if backbone not in ("metaspikformer", "spiliformer_dvs"):
+            raise ValueError(f"unknown backbone {backbone!r}")
+        self.backbone_name = backbone
+        self.tap_table = TAPS if backbone == "metaspikformer" else DVS_TAPS
+        self.stage_order = (_STAGE_ORDER if backbone == "metaspikformer"
+                            else _DVS_STAGE_ORDER)
+        if modulated_stages is None:
+            modulated_stages = (MODULATED_STAGES if backbone == "metaspikformer"
+                                else DVS_MODULATED_STAGES)
+        bad = set(taps) - set(self.tap_table)
         if bad:
-            raise ValueError(f"unknown taps {sorted(bad)}; choose from {sorted(TAPS)}")
+            raise ValueError(f"unknown taps {sorted(bad)} for {backbone}; "
+                             f"choose from {sorted(self.tap_table)}")
         self.taps = tuple(taps)
         self.in_channels = in_channels
         self.ilif = ilif
 
+        if backbone == "spiliformer_dvs":
+            self._build_spiliformer_dvs(img_size, in_channels)
+        else:
+            self._build_metaspikformer(in_channels)
+        self._finish_init(ckpt_path, ilif, modulated_stages, freeze)
+
+    def _build_metaspikformer(self, in_channels: int) -> None:
         sdt2 = forks.load_metaspikformer()
         with forks.allow_cupy_construction():
             # The metaspikformer_8_512 factory hard-codes in_channels=3, so passing ours
@@ -161,6 +194,25 @@ class EventEncoder(nn.Module):
             if isinstance(m, MultiStepLIFNode):
                 m.backend = "torch"
 
+    def _build_spiliformer_dvs(self, img_size, in_channels: int) -> None:
+        """SpiLiFormer's event-native CIFAR10-DVS variant.
+
+        `img_size_h/w` MUST be passed: they default to 128 and the repo's `SpiLiFormer()`
+        factory does not forward them, so the model would build a 128x128 assumption and
+        raise a broadcast error at any other resolution. Verified: with the real size it
+        runs at 480x640 and lands stage2 on a 30x40 grid.
+        """
+        sl = forks.load_spiliformer_dvs()
+        with forks.allow_cupy_construction():
+            self.backbone = sl.Spike_Lateral_Transformer(
+                img_size_h=img_size[0], img_size_w=img_size[1], patch_size=16,
+                embed_dims=256, num_heads=16, mlp_ratios=1, in_channels=in_channels,
+                num_classes=0, qkv_bias=False,
+                norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=4, sr_ratios=1,
+            )
+        forks.use_torch_backend(self.backbone)
+
+    def _finish_init(self, ckpt_path, ilif, modulated_stages, freeze) -> None:
         self.ckpt_report: dict[str, int] = {}
         if ckpt_path is not None:
             self.ckpt_report = self._load_imagenet(ckpt_path)
@@ -171,7 +223,7 @@ class EventEncoder(nn.Module):
         # feature taps
         self._features: dict[str, torch.Tensor] = {}
         for name in self.taps:
-            attr, _, _ = TAPS[name]
+            attr, _, _ = self.tap_table[name]
             module = getattr(self.backbone, attr)
             target = module[-1] if isinstance(module, nn.ModuleList) else module
             target.register_forward_hook(self._make_tap_hook(name))
@@ -183,14 +235,14 @@ class EventEncoder(nn.Module):
         # -- modulating it changes no output, and its 4 modulator tensors came back with
         # `grad is None` while still being counted as trainable. Filtering here keeps the
         # parameter count honest instead of advertising conditioning that cannot act.
-        deepest = max(_STAGE_ORDER[TAPS[t][0]] for t in self.taps)
+        deepest = max(self.stage_order[self.tap_table[t][0]] for t in self.taps)
         self.modulated_stages = tuple(
             s for s in modulated_stages
-            if hasattr(self.backbone, s) and _STAGE_ORDER.get(s, 99) <= deepest)
+            if hasattr(self.backbone, s) and self.stage_order.get(s, 99) <= deepest)
         dropped = [s for s in modulated_stages if s not in self.modulated_stages]
         if dropped:
             print(f"[event_encoder] not modulating {dropped}: below the deepest tap "
-                  f"({max(self.taps, key=lambda t: _STAGE_ORDER[TAPS[t][0]])})")
+                  f"({max(self.taps, key=lambda t: self.stage_order[self.tap_table[t][0]])})")
         self._gains: dict[str, torch.Tensor] | None = None
         for stage in self.modulated_stages:
             module = getattr(self.backbone, stage)
@@ -266,16 +318,17 @@ class EventEncoder(nn.Module):
     # -- properties ------------------------------------------------------------
     @property
     def out_channels(self) -> dict[str, int]:
-        return {n: TAPS[n][2] for n in self.taps}
+        return {n: self.tap_table[n][2] for n in self.taps}
 
     @property
     def strides(self) -> dict[str, int]:
-        return {n: TAPS[n][1] for n in self.taps}
+        return {n: self.tap_table[n][1] for n in self.taps}
 
     @property
     def stage_channels(self) -> dict[str, int]:
         """Input channels of each modulated stage, for sizing a ThresholdModulator."""
-        ch = {"ConvBlock2_1": 256, "ConvBlock2_2": 256, "block3": 512, "block4": 640}
+        ch = ({"ConvBlock2_1": 256, "ConvBlock2_2": 256, "block3": 512, "block4": 640}
+              if self.backbone_name == "metaspikformer" else {"stage2": 256})
         return {s: ch[s] for s in self.modulated_stages}
 
     def reset(self) -> None:
@@ -321,6 +374,9 @@ class EventEncoder(nn.Module):
             no_grad = self.frozen and gains is None
             ctx = torch.no_grad() if no_grad else contextlib.nullcontext()
             with ctx:
+                # both backbones expose forward_features((T,B,C,H,W)); the DVS variant
+                # additionally returns an intermediate, which the tap hooks already
+                # captured, so the return value is discarded either way
                 self.backbone.forward_features(cube)
         finally:
             self._gains = None

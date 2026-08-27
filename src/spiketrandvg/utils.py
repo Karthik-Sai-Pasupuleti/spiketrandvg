@@ -704,3 +704,35 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@lru_cache(maxsize=1)
+def load_spiliformer_dvs() -> types.ModuleType:
+    """SpiLiFormer's CIFAR10-DVS variant -- the event-native member of the family.
+
+    Why this one is interesting for events: `in_channels=2` is its DESIGN, not an
+    adaptation. The ImageNet variants take 3 RGB channels and have to have their stem
+    averaged onto event polarity; this one was built for DVS data from the start, and the
+    authors trained it on CIFAR10-DVS and N-Caltech101.
+
+    Two things to know before using it, both verified here:
+
+    * **No pretrained weights are published.** The repo's README links ImageNet
+      checkpoints only (T1/T4 224, T4 288, T4 384) -- nothing for CIFAR10-DVS or
+      N-Caltech101. This backbone therefore starts from random init.
+    * **It is small.** 1.7M parameters against Meta-SpikeFormer's ~55M, because it was
+      sized for 128x128 ten-class classification.
+
+    Two source defects are patched on the in-memory module, never in the fork:
+
+    * `img_size_h/w` default to 128 and the `SpiLiFormer()` factory does not forward them,
+      so the model builds with a 128x128 assumption and raises a broadcast error on any
+      other input. Pass the real size to `Spike_Lateral_Transformer` instead.
+    * `FB_LiDiff_Attention.forward` (model.py:173) ends in `.reshape(T, B, C, W, H)` with
+      W and H transposed. Invisible on square DVS frames, fatal at 480x640. The same bug
+      exists at lines 43 and 157 of the ImageNet variant, patched the same way.
+    """
+    _stub("timm")
+    mod = _load_file("spili_dvs", FORKS["spiliformer"] / "cifar10dvs" / "model.py")
+    _fix_spiliformer_square_assumption(mod)
+    return mod

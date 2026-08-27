@@ -247,6 +247,14 @@ class RefCOCOGrounding(nn.Module):
             freezing BOTH produced a caption-blind model over 85 epochs (delta +0.0009)
             while unfreezing the vision side gave +0.051 within two.
         depth: SpatialBlocks. Each is cross-attention + a spiking gated MLP.
+        event_backbone: "metaspikformer" (default, ~54.7M, ImageNet-pretrained with its
+            RGB stem averaged onto the 2 polarity channels) or "spiliformer_dvs"
+            (SpiLiFormer's CIFAR10-DVS variant, event-native `in_channels=2` by design).
+            MEASURED trade-off: the DVS variant is 1.70M parameters -- 32x smaller -- and
+            the authors publish NO CIFAR10-DVS checkpoint, so it starts from random init.
+            It is the honest event-native architecture; it is not the stronger starting
+            point. Both expose the same tap geometry at 480x640 (s8 -> 60x80, s16 ->
+            30x40), so they are a clean single-flag A/B.
         attn_type: "spatial_softmax" (default) or "cmsf_linear" -- see module docstring.
         head_type: "pooled_mlp" (default) or "attn_softargmax". MEASURED: on a 100-sample
             200-epoch A/B, `attn_softargmax` collapsed to a near-constant box (pred std
@@ -640,6 +648,7 @@ class Talk2EventGrounding(nn.Module):
         text_unfreeze_last: int = 0,
         max_log_gain: float = 0.5,
         attn_bn_gain: float = 3.0,
+        event_backbone: str = "metaspikformer",
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -654,7 +663,8 @@ class Talk2EventGrounding(nn.Module):
         self.n_attr = len(ATTRIBUTES)
 
         self.events = EventEncoder(ckpt_path=event_ckpt, taps=self.taps, in_channels=2,
-                                   ilif=ilif, freeze=freeze_event)
+                                   ilif=ilif, freeze=freeze_event,
+                                   backbone=event_backbone, img_size=self.img_size)
         self.text = TextEncoder(text_model, d_model=d_model, freeze=freeze_text,
                                 unfreeze_last=text_unfreeze_last)
         self.tagger = AttributeQueryTagger(d_model=d_model, n_attr=self.n_attr)
