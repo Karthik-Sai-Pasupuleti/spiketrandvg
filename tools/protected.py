@@ -159,10 +159,16 @@ def main() -> None:
         rates: dict[str, list[float]] = defaultdict(list)
         hooks = []
 
+        levels: dict[str, list[float]] = defaultdict(list)
+
         def mk(name):
             def h(_m, _i, o):
                 if isinstance(o, torch.Tensor):
                     rates[name].append((o.detach() > 0).float().mean().item())
+                    # I-LIF emits {0,1,2,3,4}, so "fraction nonzero" is not the health
+                    # measure a binary LIF's is -- a layer at 70% nonzero but mean level
+                    # 0.8 is firing sparsely in amplitude. Report both.
+                    levels[name].append(o.detach().float().mean().item())
             return h
 
         for name, mod in model.named_modules():
@@ -173,11 +179,17 @@ def main() -> None:
         for h in hooks:
             h.remove()
         dead = 0
+        print(f"  {'nonzero':>8s} {'mean lvl':>9s}  layer")
         for k in sorted(rates, key=lambda k: sum(rates[k]) / len(rates[k])):
             r = sum(rates[k]) / len(rates[k])
-            flag = "  DEAD" if r < 0.01 else ("  saturated" if r > 0.60 else "")
+            lv = sum(levels[k]) / len(levels[k])
+            # a binary LIF's max level is 1.0, an I-LIF's is 4.0; flag on the fraction of
+            # the available range actually used, not on the nonzero count
+            hi = 4.0 if "mem_update" in k else 1.0
+            flag = ("  DEAD" if r < 0.01 else
+                    "  SATURATED" if lv > 0.6 * hi else "")
             dead += r < 0.01
-            print(f"  {r:7.4f}  {k}{flag}")
+            print(f"  {r:8.4f} {lv:9.4f}  {k}{flag}")
         print(f"  {len(rates)} spiking layers, {dead} below 1%")
 
 
