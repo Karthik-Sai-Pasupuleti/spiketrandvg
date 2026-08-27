@@ -729,6 +729,7 @@ class Talk2EventGrounding(nn.Module):
         qk_lif: str = "ilif",
         attn_prior: bool = False,
         attn_prior_gain: float = 0.0,
+        attn_prior_eps: float = 0.01,
         pos_ratio: float | None = None,
         return_map: bool = False,
     ):
@@ -799,6 +800,7 @@ class Talk2EventGrounding(nn.Module):
         # weight: it multiplies a log-density that is an input, not a matmul whose
         # backward it would kill.
         self.attn_prior = attn_prior
+        self.attn_prior_eps = attn_prior_eps
         if attn_prior:
             self.attn_prior_gain = nn.Parameter(torch.full((1,), attn_prior_gain))
 
@@ -946,10 +948,18 @@ class Talk2EventGrounding(nn.Module):
             py = py + mass[:, None] * up(my, h)
         if off != a.shape[1]:
             raise RuntimeError(f"taps cover {off} keys but the map has {a.shape[1]}")
-        # normalise away any drift from the interpolation, then log
+        # normalise away any drift from the interpolation, so a uniform map maps to
+        # exactly 1.0 everywhere and contributes exactly zero once logged
         px = px / px.mean(-1, keepdim=True).clamp_min(1e-12)
         py = py / py.mean(-1, keepdim=True).clamp_min(1e-12)
-        return self.attn_prior_gain * torch.stack([px, py], dim=1).clamp_min(1e-8).log()
+        # Mix with the uniform density before the log. Not cosmetic: with --map-weight
+        # the map collapses to ~41 effective positions of 6000, so most slots carry
+        # essentially zero density, and d log(p)/dp = 1/p would hand the softmax
+        # gradients of order 1e8. The mixture bounds the prior to
+        # [log(eps), log(1/eps)] and the gradient to 1/eps, and leaves the mean at 1.
+        e = self.attn_prior_eps
+        p = (1 - e) * torch.stack([px, py], dim=1) + e
+        return self.attn_prior_gain * p.log()
 
     def set_collect_stats(self, on: bool) -> None:
         """Turn the two leading indicators on. Eval only -- it materialises the last
