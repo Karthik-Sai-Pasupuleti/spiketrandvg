@@ -40,6 +40,11 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=400)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--scales", type=float, nargs="*", default=None)
+    ap.add_argument("--ilif-qk", action="store_true",
+                    help="swap q_lif/k_lif for SpikeYOLO's integer I-LIF (levels {0..4}) "
+                         "before sweeping, to see what the extra levels do to the tie "
+                         "floor. Still spike-driven -- mem_update is a real LIF, "
+                         "quantised to integers rather than to a single bit.")
     args = ap.parse_args()
     if args.split == "test":
         raise SystemExit("this is a diagnostic; it does not open the test split")
@@ -70,18 +75,26 @@ def main() -> None:
     dl = DataLoader(src, batch_size=args.batch_size, shuffle=False, num_workers=6,
                     collate_fn=make_t2e_collate(build_tokenizer()), pin_memory=True)
 
+    if args.ilif_qk:
+        from spiketrandvg import utils as forks
+        mem_update, _ = forks.load_ilif()
+        for blk in model.blocks:
+            blk.attn.q_lif = mem_update().to(device)
+            blk.attn.k_lif = mem_update().to(device)
+        print("q_lif/k_lif -> I-LIF (integer levels 0..4)")
+
     default = model.blocks[0].attn.dh ** -0.5
     scales = args.scales or [default, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
     print(f"{run}/{args.ckpt} (epoch {blob.get('epoch')}) on {args.split}: "
           f"{len(src)} of {len(ds)} samples\ndefault scale = dh**-0.5 = {default:.4f}\n")
-    print(f"{'scale':>8}  {'xdefault':>8}  {'perplex':>9}  {'mIoU':>7}  {'Acc@0.5':>7}  "
-          f"{'Acc@0.75':>8}")
+    print(f"{'scale':>8}  {'xdefault':>8}  {'logit_sd':>8}  {'perplex':>9}  "
+          f"{'mIoU':>7}  {'Acc@0.5':>7}  {'Acc@0.75':>8}")
 
     for sc in scales:
         for blk in model.blocks:
             blk.attn.scale = float(sc)
         model.set_collect_stats(True)
-        ious, ppl, n = [], 0.0, 0
+        ious, ppl, lstd, n = [], 0.0, 0.0, 0
         with torch.no_grad():
             for cube, ids, mask, gt, _l, _c, _r in dl:
                 cube, ids, mask, gt = (t.to(device, non_blocking=True)
@@ -91,12 +104,13 @@ def main() -> None:
                 ious.append(box_iou(cxcywh_to_xyxy_norm(out["box"].float()),
                                     cxcywh_to_xyxy_norm(gt)).diagonal().cpu())
                 ppl += model.stats["attn_perplexity"].item() * gt.shape[0]
+                lstd += model.stats.get("logit_std", torch.zeros(())).item() * gt.shape[0]
                 n += gt.shape[0]
         model.set_collect_stats(False)
         t = torch.cat(ious)
-        print(f"{sc:8.4f}  {sc/default:8.1f}  {ppl/n:9.1f}  {t.mean():7.4f}  "
-              f"{(t >= 0.5).float().mean():7.4f}  {(t >= 0.75).float().mean():8.4f}",
-              flush=True)
+        print(f"{sc:8.4f}  {sc/default:8.1f}  {lstd/n:8.3f}  {ppl/n:9.1f}  "
+              f"{t.mean():7.4f}  {(t >= 0.5).float().mean():7.4f}  "
+              f"{(t >= 0.75).float().mean():8.4f}", flush=True)
 
 
 if __name__ == "__main__":

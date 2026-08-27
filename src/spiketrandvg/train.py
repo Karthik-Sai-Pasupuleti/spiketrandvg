@@ -239,6 +239,12 @@ def main() -> None:
     t2e.add_argument("--no-ilif", action="store_true",
                      help="keep binary LIF instead of integer I-LIF")
     t2e.add_argument("--freeze-event", action="store_true")
+    t2e.add_argument("--qk-lif", default="binary", choices=["binary", "ilif"],
+                     help="activation on the attention's q and k projections. binary: "
+                          "CMSF's Dynamic_Threshold_LIFNode, {0,1}. ilif: SpikeYOLO's "
+                          "integer mem_update, {0..4} -- still a LIF, and the one that "
+                          "breaks the tie floor a binary dot product imposes on the "
+                          "softmax. See SpatialCrossAttention.__init__")
     t2e.add_argument("--attn-scale", type=float, default=None,
                      help="softmax temperature in SpatialCrossAttention. Default None "
                           "= dh**-0.5, the analog-q/k transformer value. q and k are "
@@ -637,7 +643,7 @@ def main_t2e(args) -> None:
         depth=args.depth, n_slots=args.n_slots, ilif=not args.no_ilif,
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
-        pos_std=args.pos_std, attn_scale=args.attn_scale,
+        pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
@@ -692,7 +698,7 @@ def main_t2e(args) -> None:
         (out / "log.tsv").write_text(
             "epoch\tstep\tloss\tbox\tslot\ttag\ttrain_iou\ttrain_mIoU\tlr\tmIoU\tAcc@0.25\t"
             "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tperplex\tn_keys\tpos_rms\t"
-            "q_rate\tk_rate\tsec\n")
+            "q_rate\tk_rate\tlogit_sd\tsec\n")
 
     t0, stop = time.time(), False
     for epoch in range(start_epoch, args.epochs):
@@ -765,7 +771,8 @@ def main_t2e(args) -> None:
                     f"{m.get('n_keys', float('nan')):.0f}\t"
                     f"{m.get('pos_rms_ratio', float('nan')):.5f}\t"
                     f"{m.get('q_rate', float('nan')):.4f}\t"
-                    f"{m.get('k_rate', float('nan')):.4f}\t{int(time.time()-t0)}\n")
+                    f"{m.get('k_rate', float('nan')):.4f}\t"
+                    f"{m.get('logit_std', float('nan')):.3f}\t{int(time.time()-t0)}\n")
 
         blob = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch,
                 "gstep": gstep, "args": vars(args), "metrics": m}

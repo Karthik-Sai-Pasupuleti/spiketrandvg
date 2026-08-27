@@ -149,7 +149,7 @@ class SpatialCrossAttention(nn.Module):
     """
 
     def __init__(self, dim: int, num_heads: int = 8, attn_drop: float = 0.0,
-                 scale: float | None = None):
+                 scale: float | None = None, qk_lif: str = "binary"):
         super().__init__()
         if dim % num_heads:
             raise ValueError(f"dim {dim} not divisible by num_heads {num_heads}")
@@ -181,6 +181,37 @@ class SpatialCrossAttention(nn.Module):
                 for _ in range(3))
             self.proj_lif = cmsf.Dynamic_Threshold_LIFNode(
                 tau=2.0, detach_reset=True, backend="cupy")
+        if qk_lif not in ("binary", "ilif"):
+            raise ValueError(f"unknown qk_lif {qk_lif!r}")
+        self.qk_lif = qk_lif
+        if qk_lif == "ilif":
+            # Integer I-LIF on the two projections that FORM the logits. This is not a
+            # relaxation of the spiking constraint: `mem_update` is a real LIF with a
+            # soft reset that quantises to {0,1,2,3,4} instead of {0,1}, and the event
+            # encoder already runs on it (`--no-ilif` is the ablation against it). The
+            # attention projections were the one place still binary.
+            #
+            # Why it is the right knob. A softmax over N keys can only be non-uniform if
+            # the logits SPREAD over order log(N). With binary q,k the logit is
+            # (q.k)/sqrt(dh), an integer overlap count out of dh=32 -- and MEASURED on
+            # probe_00/best.pth, raising the temperature stops helping at perplexity 548
+            # of 6000 no matter how far it is raised, because the softmax has become a
+            # hard max over the ~548 keys TIED at the maximum overlap. That floor
+            # belongs to the binary code, not to the temperature.
+            #
+            # Five levels per unit instead of two make q.k range over 0..512 and make
+            # exact ties rare. MEASURED on the same checkpoint, same 127 val samples:
+            #
+            #   q/k       scale    logit sd   perplexity
+            #   binary   0.1768       0.529       4984.6
+            #   binary   4.0000      12.011        679.2   (floor at 548)
+            #   I-LIF    0.1768       7.108        679.5
+            #   I-LIF    1.0000      39.583        123.3
+            #
+            # At the SAME scale the map is 7x sharper, and unlike the binary code it
+            # keeps sharpening past the floor.
+            sy_mem_update, _ = forks.load_ilif()
+            self.q_lif, self.k_lif = sy_mem_update(), sy_mem_update()
         forks.use_torch_backend(self)
         self.proj = nn.Linear(dim, dim)
         self.proj_bn = nn.BatchNorm1d(dim)
@@ -223,6 +254,11 @@ class SpatialCrossAttention(nn.Module):
         v = v.reshape(T, B, N, self.h, self.dh).permute(0, 1, 3, 2, 4)
 
         logits = (q @ k.transpose(-2, -1)) * self.scale                   # (T,B,h,Lq,N)
+        if self.collect_stats:
+            # spread of the logits ACROSS KEYS, per query -- the quantity that decides
+            # whether a softmax over N keys can be anything but uniform. Needs to reach
+            # order log(N) before the map carries location.
+            self.last_rates["logit_std"] = logits.detach().float().std(dim=-1).mean()
         if key_mask is not None:
             logits = logits.masked_fill(~key_mask[None, :, None, None, :].bool(),
                                         torch.finfo(logits.dtype).min)
@@ -239,10 +275,11 @@ class SpatialBlock(nn.Module):
     """SpatialCrossAttention + CMSF's spiking gated MLP, residual."""
 
     def __init__(self, dim: int, num_heads: int = 8, mlp_ratio: float = 2.0,
-                 attn_scale: float | None = None):
+                 attn_scale: float | None = None, qk_lif: str = "binary"):
         super().__init__()
         cmsf = forks.load_cmsf()
-        self.attn = SpatialCrossAttention(dim, num_heads, scale=attn_scale)
+        self.attn = SpatialCrossAttention(dim, num_heads, scale=attn_scale,
+                                          qk_lif=qk_lif)
         with forks.allow_cupy_construction():
             self.mlp = cmsf.Spiking_GFNN(dim=dim, hidden_dim=int(dim * mlp_ratio))
         forks.use_torch_backend(self)
@@ -679,6 +716,7 @@ class Talk2EventGrounding(nn.Module):
         event_backbone: str = "spiliformer_dvs",
         pos_std: float = 0.02,
         attn_scale: float | None = None,
+        qk_lif: str = "binary",
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -722,8 +760,8 @@ class Talk2EventGrounding(nn.Module):
         # the head still cross-attends -- conditioning the encoder ADDS a pathway, it
         # does not replace this one
         self.blocks = nn.ModuleList(
-            [SpatialBlock(d_model, num_heads, mlp_ratio, attn_scale=attn_scale)
-             for _ in range(depth)])
+            [SpatialBlock(d_model, num_heads, mlp_ratio, attn_scale=attn_scale,
+                          qk_lif=qk_lif) for _ in range(depth)])
         self._revive_attention_bn(attn_bn_gain)
         self.q_norm = nn.LayerNorm(d_model)
         self.v_norm = nn.LayerNorm(d_model)
