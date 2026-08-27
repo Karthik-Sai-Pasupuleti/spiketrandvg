@@ -601,10 +601,20 @@ def evaluate_t2e(model, loader, device, amp_ctx, keep: list[bool] | None = None,
                 st = dict(model.stats)
                 if "attn" in out:
                     # THE localisation indicator: what fraction of the attention map's
-                    # mass lands inside the true box. A uniform map scores the box's own
-                    # area fraction, ~0.011 here, and that is the number to beat before
-                    # anything downstream can read a position off the map.
-                    st["box_mass"] = model.attn_box_mass(out["attn"], gt).mean()
+                    # mass lands inside the true box, and -- the number that is actually
+                    # readable -- how many times CHANCE that is.
+                    #
+                    # Chance is not the box's area fraction. The mask is the set of grid
+                    # cells whose centres fall in the box, which at stride 8 and 16 is
+                    # coarser than the box itself, and it differs per sample. So chance
+                    # is measured by running the SAME mask over a uniform map. Quoting
+                    # an area fraction instead is wrong by a factor of two here: val's
+                    # mean box area is 0.0200 and its median is 0.0108.
+                    bm = model.attn_box_mass(out["attn"], gt)
+                    unif = torch.full_like(out["attn"], 1.0 / out["attn"].shape[-1])
+                    st["box_mass"] = bm.mean()
+                    st["box_mass_x"] = (bm / model.attn_box_mass(unif, gt)
+                                        .clamp_min(1e-8)).mean()
                 for k, v in st.items():
                     acc[k] = acc.get(k, torch.zeros((), device=v.device)) + v.float() * b
             if keep is not None:
@@ -734,7 +744,7 @@ def main_t2e(args) -> None:
         (out / "log.tsv").write_text(
             "epoch\tstep\tloss\tbox\tslot\ttag\ttrain_iou\ttrain_mIoU\tlr\tmIoU\tAcc@0.25\t"
             "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tperplex\tn_keys\tpos_rms\t"
-            "q_rate\tk_rate\tlogit_sd\tbox_mass\tsec\n")
+            "q_rate\tk_rate\tlogit_sd\tbox_mass\tbox_mass_x\tsec\n")
 
     t0, stop = time.time(), False
     for epoch in range(start_epoch, args.epochs):
@@ -802,7 +812,7 @@ def main_t2e(args) -> None:
               + f" | perplex {m.get('attn_perplexity', float('nan')):.1f}"
                 f"/{m.get('n_keys', float('nan')):.0f} "
                 f"pos_rms {m.get('pos_rms_ratio', float('nan')):.4f} "
-                f"box_mass {m.get('box_mass', float('nan')):.4f}"
+                f"box_mass {m.get('box_mass_x', float('nan')):.2f}x"
               + f" | {(time.time()-t0)/60:.1f} min "
                 f"{torch.cuda.max_memory_allocated()/2**30:.1f} GiB", flush=True)
 
@@ -818,7 +828,8 @@ def main_t2e(args) -> None:
                     f"{m.get('q_rate', float('nan')):.4f}\t"
                     f"{m.get('k_rate', float('nan')):.4f}\t"
                     f"{m.get('logit_std', float('nan')):.3f}\t"
-                    f"{m.get('box_mass', float('nan')):.5f}\t{int(time.time()-t0)}\n")
+                    f"{m.get('box_mass', float('nan')):.5f}\t"
+                    f"{m.get('box_mass_x', float('nan')):.4f}\t{int(time.time()-t0)}\n")
 
         blob = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch,
                 "gstep": gstep, "args": vars(args), "metrics": m}
