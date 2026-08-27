@@ -244,18 +244,20 @@ def main() -> None:
                           "is 4800+1200 = 6000 keys at 480x640; s16 alone is 1200, which "
                           "lowers the log(N) a softmax has to spread over by 1.6 nats "
                           "and drops 80%% of the attention compute")
-    t2e.add_argument("--pos-ratio", type=float, default=None,
+    t2e.add_argument("--pos-ratio", type=float, default=0.5,
                      help="pin RMS(pos) to this fraction of RMS(lateral) every forward. "
                           "Default None keeps --pos-std's init and lets the ratio drift "
                           "wherever training takes it (measured on probe_00: 0.039 -> "
                           "0.018 -> 0.034 over 6 epochs). Below ~0.05 the positional "
-                          "signal is thresholded away before it can inform the map")
-    t2e.add_argument("--attn-prior", action="store_true",
+                          "signal is thresholded away before it can inform the map. "
+                          "DEFAULT 0.5 since probe_08; 0 is the ablation")
+    t2e.add_argument("--no-attn-prior", dest="attn_prior", action="store_false",
                      help="feed the attention map's spatial marginals to SlotBoxHead as "
                           "a learnable-gain log-prior on the cx/cy slots. Zero-init, so "
                           "it starts as exactly the unmodified model. This is the only "
                           "path by which the analog attention map reaches the box head "
-                          "without first being binarised by proj_lif")
+                          "without first being binarised by proj_lif. ON by default "
+                          "since probe_06; --no-attn-prior is the ablation")
     t2e.add_argument("--map-weight", type=float, default=1.0,
                      help="weight on -log(attention mass inside the true box). Nothing "
                           "else supervises WHERE the map points: the box loss reaches "

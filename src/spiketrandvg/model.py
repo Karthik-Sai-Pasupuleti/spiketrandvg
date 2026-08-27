@@ -727,11 +727,11 @@ class Talk2EventGrounding(nn.Module):
         pos_std: float = 0.02,
         attn_scale: float | None = None,
         qk_lif: str = "ilif",
-        attn_prior: bool = False,
+        attn_prior: bool = True,
         attn_prior_gain: float = 0.0,
         attn_prior_eps: float = 0.01,
         query_weights: bool = False,
-        pos_ratio: float | None = None,
+        pos_ratio: float | None = 0.5,
         return_map: bool = False,
     ):
         super().__init__()
@@ -819,7 +819,9 @@ class Talk2EventGrounding(nn.Module):
         # The scale factor is DETACHED, so gradient shapes the positional PATTERN while
         # its amplitude stays pinned. Without that the optimiser can shrink the table and
         # the rescale silently undoes the shrink, which is a fight, not a control.
-        self.pos_ratio = pos_ratio
+        # <= 0 disables, so `--pos-ratio 0` is the ablation rather than a request to
+        # scale the positional table to exactly zero
+        self.pos_ratio = pos_ratio if (pos_ratio or 0) > 0 else None
         # hand the last block's attention map back to the trainer, so it can be
         # supervised directly (see `attn_box_mass`)
         self.return_map = return_map
