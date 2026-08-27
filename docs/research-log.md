@@ -588,3 +588,29 @@ benchmark paper does not publish. And it makes Lane A load-bearing: the one cue 
 is language that names a position, which can only be matched against a positional signal
 in the keys -- the signal measured at RMS ratio 0.019-0.035, below the 0.05 floor, for the
 entire baseline run.
+
+## 17. What the map is actually looking at
+
+`probe_01/best.pth` (perplexity 348, the sharpest so far), 228 val samples, last block's
+map averaged over T, heads and the four queries.
+
+* **88.4% of the mass sits on the s8 tap** and 11.6% on s16 -- roughly the 80/20 the key
+  counts alone would give (4800 vs 1200), so the deeper, more semantic tap is being read
+  barely more than chance would read it.
+* The mean map peaks in the bottom-left corner and has a visible border bias.
+* It is **not** a constant: across-sample variance / mean^2 = 13.7, so it does respond to
+  the input.
+* But what it responds to is not the referent. **corr(map cx, gt cx) = 0.230,
+  corr(map cy, gt cy) = 0.041.**
+* And its dynamic range is wrong: the map's centre estimate has std 0.060 in x against a
+  ground-truth std of 0.231. It is squeezed 4x toward the image centre.
+
+Also worth having on record: **gt cy has std 0.0462** while gt cx has std 0.2311. Objects
+in driving scenes sit in a narrow band around the horizon, so the vertical coordinate is
+nearly free and **cx is where localisation is won or lost**. corr(map cx, gt cx) = 0.23 is
+therefore the signal to amplify, and it is the one `--map-weight` supervises directly.
+
+This is the missing half of section 12. `--attn-scale` concentrated the map (perplexity
+4967 -> 348) without making it point anywhere useful, and perplexity alone could not
+distinguish those two outcomes. `box_mass` -- the fraction of the map's mass inside the
+true box, uniform-map baseline 0.011 -- was added for exactly that reason.
