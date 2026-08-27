@@ -559,3 +559,32 @@ boxes below about 2.2 px -- **0.00% of train, val and test**. The slot head is n
 limiting precision, and raising `--n-slots` would be wasted work. The stride-16 feature
 grid, at 16 px per cell against a 6.7 px tolerance, is a real constraint on any head that
 reads a cell index rather than a sub-cell expectation.
+
+## 16. The model localises from viewer-relative geometry and almost nothing else
+
+`tools/protected.py --what attributes`, `probe_00/best.pth`, 380 val samples. The caption
+is reduced to ONE of Talk2Event's four annotated attribute groups, its phrases
+comma-joined, and the model is scored on that alone.
+
+| caption content | n | mIoU | Acc@0.5 | Acc@0.75 |
+|---|---|---|---|---|
+| full caption | 380 | 0.2411 | 0.1184 | 0.0026 |
+| appearance only | 380 | 0.0501 | 0.0105 | 0.0000 |
+| status only | 378 | 0.0532 | 0.0000 | 0.0000 |
+| **relation_viewer only** | 378 | **0.1507** | **0.0608** | 0.0026 |
+| relation_others only | 375 | 0.0731 | 0.0400 | 0.0027 |
+
+A constant mean box scores ~0.06 on this data, so **appearance and status alone are at the
+trivial floor** and `relation_viewer` -- "on the left side of the road", "in front of the
+viewer" -- carries essentially all of the localisation. The model is not finding the
+described object; it is decoding a coarse position out of the sentence.
+
+Caveat, stated because it cuts the other way: a comma-joined phrase list is out of
+distribution for a model trained on full sentences, so each row understates that
+attribute's contribution in context. The RANKING is the finding, not the absolute values.
+
+Two consequences. It is the table the four-sub-query design exists to produce and the
+benchmark paper does not publish. And it makes Lane A load-bearing: the one cue that works
+is language that names a position, which can only be matched against a positional signal
+in the keys -- the signal measured at RMS ratio 0.019-0.035, below the 0.05 floor, for the
+entire baseline run.
