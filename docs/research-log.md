@@ -761,3 +761,21 @@ which coordinate is wrong does not mean reweighting its L1 term is how to fix it
 `--map-weight 3.0` (`probe_09`) is worse than 1.0 on every accuracy metric while aiming
 the map very slightly better (41.1x vs 39.1x). The supervision is already doing its job at
 1.0 and the extra weight is spent against the box loss.
+
+## 21. Firing rates after the encoder changes (protected, recorded)
+
+`tools/protected.py --what firing` on `probe_06/best.pth`, the best checkpoint at the time.
+**33 spiking layers, 0 below 1%** -- no LIF is dead, so no residual branch has silently
+become the identity.
+
+One caveat that mattered: an I-LIF emits {0,1,2,3,4}, so "fraction of units nonzero" is
+not the health measure a binary LIF's is. Four backbone layers read 62-73% nonzero and are
+at mean level 0.90-1.09 out of an available 4.0 -- sparse in amplitude, perfectly healthy.
+Judged on the fraction of the available range actually used, exactly one layer is
+saturated: `events.backbone.stage1.0.tssa.attn_lif`, mean level 2.48 of 4.0 at 92%
+nonzero, an attention LIF inside SpiLiFormer-DVS's own design rather than anything this
+branch introduced.
+
+The fusion's own q/k, switched to I-LIF in `probe_02`, sit at mean level 1.24-1.34 and
+41-46% nonzero -- in range, and using about a third of the amplitude the integer code
+makes available, which is what gives the logits their spread.
