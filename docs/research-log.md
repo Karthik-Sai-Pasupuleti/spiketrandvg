@@ -809,3 +809,42 @@ budget, not a converged one, so this is the promotion candidate.
 For scale: the pre-existing `runs/t2e_100` reported mIoU 0.2399, but that was best-of-35
 selected ON TEST (section 10.1). The honest comparison is against `probe_00`'s 0.2319 on a
 split nothing has ever selected on.
+
+## 23. Which sub-query should the map be read through? Not the one section 16 predicts
+
+`probe_13` adds `--query-weights`: a zero-initialised, learnable softmax over the four
+attribute sub-queries, used to pool their attention maps for both the supervision and the
+prior. The prediction from section 16 was that `relation_viewer` would win, since it is
+the only attribute whose caption localises at all on its own.
+
+**The change is neutral and is discarded** (acc50 0.2471 vs `probe_10`'s 0.2544, acc75
+0.0304 vs 0.0325, mIoU a tie at 0.3093, `caption_delta` +0.2031 vs +0.2113). By the
+simplicity criterion, added code that does not help comes out.
+
+But the weights it learned are worth recording:
+
+| sub-query | learned weight | that attribute's caption ALONE (section 16) |
+|---|---|---|
+| appearance | 0.049 | mIoU 0.0501 |
+| **status** | **0.830** | mIoU 0.0532 |
+| relation_viewer | 0.073 | mIoU 0.1507 |
+| relation_others | 0.049 | mIoU 0.0731 |
+
+It put 83% of the mass on **`status`** -- the attribute whose text, on its own, is at the
+trivial floor -- and 7% on `relation_viewer`, the only one that localises from text alone.
+The prediction was backwards.
+
+A mechanism that would explain it, offered as a hypothesis and not as a result: an event
+camera encodes MOTION, and `status` ("parked stationary", "driving", "moving") is the
+motion attribute. The two measurements ask different questions. Section 16 asks what a
+caption can localise when it is all the model gets; this asks which sub-query produces the
+most spatially discriminative ATTENTION MAP over event features. A status phrase says
+nothing about where the object is, but the query vector derived from it may select exactly
+the event-density signature that does -- because motion is the thing this sensor actually
+sees. If that holds up it is a genuinely event-specific result, and it is the kind of
+thing a frame-based grounding model could not produce.
+
+Caveats that have to travel with it: this is one 8-epoch optimiser trajectory, the change
+it came from did not improve accuracy, and nothing here rules out the weights having
+collapsed onto `status` for a reason unrelated to localisation. It needs replication at a
+longer budget and across seeds before it is more than an observation.

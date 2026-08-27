@@ -779,8 +779,8 @@ def main_t2e(args) -> None:
                 mass = model.attn_box_mass(o["attn"], gt)
                 map_nll = -(mass.clamp_min(1e-8)).log().mean()
                 loss = loss + args.map_weight * map_nll
-                run["map"] += float(map_nll) * gt.shape[0]
-                run["mass"] += float(mass.mean()) * gt.shape[0]
+                run["map"] += map_nll.detach().item() * gt.shape[0]
+                run["mass"] += mass.detach().mean().item() * gt.shape[0]
             (loss / args.accum).backward()
 
             if (it + 1) % args.accum == 0:
