@@ -1,0 +1,24 @@
+# Held-out Talk2Event validation sequences -- FROZEN 2026-08-27, never regenerate.
+#
+# Talk2Event ships train/test only. Selecting `best.pth` on `test` is model
+# selection on the test set, so these 8 of the 47 TRAIN sequences are carved out
+# as `val`. The split is by SEQUENCE, so no driving scene appears in both, and
+# `val` is a domain shift to unseen streets exactly as `test` is.
+#
+# Rule that produced this list, for the record: group the 47 train sequences by
+# location prefix (interlaken / thun / zurich_city); a stratum with fewer than 3
+# sequences stays wholly in train, since holding it out would delete that
+# location from training (thun has one sequence, 26 samples); within each
+# remaining stratum, shuffle with seed 20260827 and accept each sequence only if
+# it moves the running total CLOSER to 15% of that stratum's samples.
+#
+# Result: 8 sequences, 1140 of 7675 samples (14.9%). train keeps 39 sequences,
+# 6535 samples. interlaken 13.2% held out, zurich_city 15.1%, thun 0%.
+interlaken_00_c
+interlaken_00_f
+zurich_city_01_b
+zurich_city_02_a
+zurich_city_02_c
+zurich_city_04_f
+zurich_city_10_b
+zurich_city_19_a

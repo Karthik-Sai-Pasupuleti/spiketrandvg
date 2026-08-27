@@ -169,6 +169,13 @@ class SpatialCrossAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_bn = nn.BatchNorm1d(dim)
         self.attn_drop = nn.Dropout(attn_drop) if attn_drop > 0 else nn.Identity()
+        # Diagnostics, off by default so the training path pays nothing. When on,
+        # `last_rates` holds the fraction of q and k units that fired -- a dead
+        # projection (<1%) makes the attention map meaningless before any other
+        # explanation is worth considering. Kept as GPU tensors: reading a Python float
+        # here would force a device sync on every forward.
+        self.collect_stats = False
+        self.last_rates: dict[str, torch.Tensor] = {}
 
     def _spike_proj(self, x, lin, bn, lif):
         """(T,B,L,D) -> (T,B,L,D) through Linear + BN + LIF, CMSF's ordering."""
@@ -190,6 +197,10 @@ class SpatialCrossAttention(nn.Module):
         q = self._spike_proj(query, self.q_linear, self.q_bn, self.q_lif)
         k = self._spike_proj(key, self.k_linear, self.k_bn, self.k_lif)
         v = self._spike_proj(value, self.v_linear, self.v_bn, self.v_lif)
+
+        if self.collect_stats:
+            self.last_rates = {"q_rate": (q.detach() > 0).float().mean(),
+                               "k_rate": (k.detach() > 0).float().mean()}
 
         q = q.reshape(T, B, Lq, self.h, self.dh).permute(0, 1, 3, 2, 4)   # (T,B,h,Lq,dh)
         k = k.reshape(T, B, N, self.h, self.dh).permute(0, 1, 3, 2, 4)
@@ -649,6 +660,7 @@ class Talk2EventGrounding(nn.Module):
         max_log_gain: float = 0.5,
         attn_bn_gain: float = 3.0,
         event_backbone: str = "spiliformer_dvs",
+        pos_std: float = 0.02,
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -685,7 +697,7 @@ class Talk2EventGrounding(nn.Module):
                 img_size[1] // self.events.strides[t]))
             for t in self.taps})
         for p in self.pos.values():
-            nn.init.trunc_normal_(p, std=0.02)
+            nn.init.trunc_normal_(p, std=pos_std)
         self.level = nn.Parameter(torch.zeros(len(self.taps), d_model))
         nn.init.trunc_normal_(self.level, std=0.02)
 
@@ -698,6 +710,18 @@ class Talk2EventGrounding(nn.Module):
         self.v_norm = nn.LayerNorm(d_model)
         self.head_norm = nn.LayerNorm(d_model)
         self.box_head = SlotBoxHead(d_model, n_slots=n_slots)
+
+        # Two leading indicators, measured in eval only (see `set_collect_stats`). They
+        # move before accuracy does, which is the whole reason they are here:
+        #   attn_perplexity  effective number of vision positions a query attends.
+        #                    Equal to the key count = uniform = the map carries no
+        #                    location at all, whatever the loss says.
+        #   pos_rms_ratio    RMS(positional table) / RMS(lateral output it is added to).
+        #                    Below ~0.05 position is a sub-1% perturbation on features
+        #                    that then cross a firing threshold, so it never survives
+        #                    into the attention logits.
+        self.collect_stats = False
+        self.stats: dict[str, torch.Tensor] = {}
 
     def _revive_attention_bn(self, gain: float) -> None:
         """tdBN-style init on the cross-attention BatchNorms. NOT optional here.
@@ -750,6 +774,13 @@ class Talk2EventGrounding(nn.Module):
             if isinstance(m, sj_neuron.BaseNode):
                 m.reset()
 
+    def set_collect_stats(self, on: bool) -> None:
+        """Turn the two leading indicators on. Eval only -- it materialises the last
+        block's attention map, which the training path is careful not to keep."""
+        self.collect_stats = on
+        for blk in self.blocks:
+            blk.attn.collect_stats = on
+
     def forward(self, cube, input_ids, attention_mask):
         if cube.dim() != 5 or cube.shape[0] != self.T:
             raise ValueError(f"expected (T={self.T},B,2,H,W) cube, got {tuple(cube.shape)}")
@@ -767,6 +798,7 @@ class Talk2EventGrounding(nn.Module):
         pooled_feats = self.events.accumulate(feats)            # {tap:(B,C,h,w)} REAL
 
         toks = []
+        lat_ms, pos_ms = [], []
         for i, t in enumerate(self.taps):
             f = self.tap_norm[t](pooled_feats[t])
             x = self.lateral[t](f)                              # (B,d,h,w)
@@ -774,6 +806,10 @@ class Talk2EventGrounding(nn.Module):
             if pos.shape[-2:] != x.shape[-2:]:
                 pos = nn.functional.interpolate(pos, size=x.shape[-2:],
                                                 mode="bilinear", align_corners=False)
+            if self.collect_stats:
+                # measured BEFORE the addition -- the ratio of the two is the question
+                lat_ms.append(x.detach().float().pow(2).mean())
+                pos_ms.append(pos.detach().float().pow(2).mean())
             x = x + pos + self.level[i].view(1, -1, 1, 1)
             B, d, h, w = x.shape
             toks.append(x.reshape(B, d, h * w).permute(0, 2, 1))
@@ -783,9 +819,26 @@ class Talk2EventGrounding(nn.Module):
         # no time left, so run it as T=1 -- one real-valued step, not a spiking one.
         q = self.q_norm(queries).unsqueeze(0)                   # (1,B,4,d)
         v = self.v_norm(vis).unsqueeze(0)                       # (1,B,N,d)
-        for blk in self.blocks:
-            q = blk(q, v)
+        attn = None
+        for i, blk in enumerate(self.blocks):
+            if self.collect_stats and i == len(self.blocks) - 1:
+                q, attn = blk(q, v, return_attn=True)
+            else:
+                q = blk(q, v)
         q = q.squeeze(0)                                        # (B,4,d)
+
+        if self.collect_stats:
+            # perplexity = exp(entropy) of the post-softmax weights, per (T,B,head,
+            # query), then averaged. fp32: under bf16 autocast the log of a ~1/6000
+            # weight has no mantissa left to be right with.
+            a = attn.detach().float().clamp_min(1e-12)          # (T,B,h,Lq,N)
+            ppl = torch.exp(-(a * a.log()).sum(-1)).mean()
+            self.stats = {"attn_perplexity": ppl,
+                          "n_keys": torch.as_tensor(float(vis.shape[1]), device=ppl.device),
+                          "pos_rms_ratio": (torch.stack(pos_ms).mean().sqrt()
+                                            / torch.stack(lat_ms).mean().sqrt().clamp_min(1e-12))}
+            for k_, v_ in self.blocks[-1].attn.last_rates.items():
+                self.stats[k_] = v_
 
         pooled = self.head_norm(q.mean(dim=1))                  # (B,d)
         box, slot_logits = self.box_head(pooled)

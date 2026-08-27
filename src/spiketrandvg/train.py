@@ -249,7 +249,9 @@ def main() -> None:
         d = ap.parse_args([])                       # what the defaults would have been
         if args.size == d.size:       args.size = (480, 640)
         if args.T == d.T:             args.T = 5
-        if args.val_split == d.val_split:   args.val_split = "test"
+        # NOT `test`: selecting best.pth on test is model selection on the test set.
+        # `val` is 8 held-out train sequences -- see dataloader.T2E_VAL_SEQ_FILE.
+        if args.val_split == d.val_split:   args.val_split = "val"
         if args.run_name == d.run_name:     args.run_name = "talk2event"
         if args.batch_size == d.batch_size: args.batch_size = 4
         return main_t2e(args)
@@ -533,26 +535,49 @@ class _T2ECaptionOverride(Dataset):
 
 
 @torch.no_grad()
-def evaluate_t2e(model, loader, device, amp_ctx, keep: list[bool] | None = None):
-    """mIoU and Acc@thresholds for Talk2EventGrounding (which returns a dict)."""
+def evaluate_t2e(model, loader, device, amp_ctx, keep: list[bool] | None = None,
+                 stats: bool = False):
+    """mIoU and Acc@thresholds for Talk2EventGrounding (which returns a dict).
+
+    `stats=True` additionally averages the model's leading indicators over the split --
+    `attn_perplexity`, `pos_rms_ratio` and the q/k firing rates. Off by default so the
+    three extra passes an epoch does (train, blind, hard subset) pay nothing for a
+    number only the val pass is asked for. The sums stay on the GPU until the end, so
+    the whole thing costs one device sync per call rather than one per batch.
+    """
     model.eval()
+    if stats:
+        model.set_collect_stats(True)
+    acc: dict[str, torch.Tensor] = {}
     ious, flags, seen = [], [], 0
-    for cube, ids, mask, gt, _lab, _caps, _recs in loader:
-        cube, ids, mask, gt = (t.to(device, non_blocking=True)
-                               for t in (cube, ids, mask, gt))
-        with amp_ctx():
-            out = model(cube, ids, mask)
-        i = box_iou(cxcywh_to_xyxy_norm(out["box"].float()),
-                    cxcywh_to_xyxy_norm(gt)).diagonal()
-        ious.append(i.cpu())
-        if keep is not None:
-            flags.extend(keep[seen:seen + len(i)])
-        seen += len(i)
+    try:
+        for cube, ids, mask, gt, _lab, _caps, _recs in loader:
+            cube, ids, mask, gt = (t.to(device, non_blocking=True)
+                                   for t in (cube, ids, mask, gt))
+            with amp_ctx():
+                out = model(cube, ids, mask)
+            i = box_iou(cxcywh_to_xyxy_norm(out["box"].float()),
+                        cxcywh_to_xyxy_norm(gt)).diagonal()
+            ious.append(i.cpu())
+            if stats:
+                b = float(gt.shape[0])
+                for k, v in model.stats.items():
+                    acc[k] = acc.get(k, torch.zeros((), device=v.device)) + v.float() * b
+            if keep is not None:
+                flags.extend(keep[seen:seen + len(i)])
+            seen += len(i)
+    finally:
+        if stats:
+            model.set_collect_stats(False)
     t = torch.cat(ious)
     if keep is not None:
         t = t[torch.tensor(flags, dtype=torch.bool)]
-    return {"n": len(t), "mIoU": t.mean().item(),
-            **{f"Acc@{th}": (t >= th).float().mean().item() for th in IOU_THRESHOLDS}}
+    out = {"n": len(t), "mIoU": t.mean().item(),
+           **{f"Acc@{th}": (t >= th).float().mean().item() for th in IOU_THRESHOLDS}}
+    # `seen` (every sample the loader yielded), not `n` (what `keep` left) -- the stats
+    # were accumulated over the former.
+    out.update({k: (v / max(1, seen)).item() for k, v in acc.items()})
+    return out
 
 
 def slot_targets(box: torch.Tensor, n_slots: int) -> torch.Tensor:
@@ -607,6 +632,7 @@ def main_t2e(args) -> None:
         depth=args.depth, n_slots=args.n_slots, ilif=not args.no_ilif,
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
+        pos_std=args.pos_std,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
@@ -660,7 +686,8 @@ def main_t2e(args) -> None:
     if not (out / "log.tsv").exists():
         (out / "log.tsv").write_text(
             "epoch\tstep\tloss\tbox\tslot\ttag\ttrain_iou\ttrain_mIoU\tlr\tmIoU\tAcc@0.25\t"
-            "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tsec\n")
+            "Acc@0.5\tAcc@0.75\tAcc@0.9\tblind_mIoU\tdelta\tperplex\tn_keys\tpos_rms\t"
+            "q_rate\tk_rate\tsec\n")
 
     t0, stop = time.time(), False
     for epoch in range(start_epoch, args.epochs):
@@ -702,7 +729,7 @@ def main_t2e(args) -> None:
             if args.max_iters and it + 1 >= args.max_iters:
                 break
 
-        m = evaluate_t2e(model, val_dl, device, amp_ctx)
+        m = evaluate_t2e(model, val_dl, device, amp_ctx, stats=True)
         train_m = evaluate_t2e(model, train_eval_dl, device, amp_ctx)
         gap = train_m["mIoU"] - run["iou"] / seen
         blind = (evaluate_t2e(model, blind_dl, device, amp_ctx, keep=keep)
@@ -717,6 +744,9 @@ def main_t2e(args) -> None:
               f"mIoU {m['mIoU']:.4f}  Acc@0.25 {m['Acc@0.25']:.4f}  Acc@0.5 {m['Acc@0.5']:.4f}  "
               f"Acc@0.75 {m['Acc@0.75']:.4f}  Acc@0.9 {m['Acc@0.9']:.4f}"
               + (f" | blind {blind['mIoU']:.4f} delta {delta:+.4f}" if blind else "")
+              + f" | perplex {m.get('attn_perplexity', float('nan')):.1f}"
+                f"/{m.get('n_keys', float('nan')):.0f} "
+                f"pos_rms {m.get('pos_rms_ratio', float('nan')):.4f}"
               + f" | {(time.time()-t0)/60:.1f} min", flush=True)
 
         with open(out / "log.tsv", "a") as f:
@@ -725,7 +755,11 @@ def main_t2e(args) -> None:
                     f"{train_m['mIoU']:.4f}\t{mult:.4f}\t{m['mIoU']:.4f}\t"
                     f"{m['Acc@0.25']:.4f}\t{m['Acc@0.5']:.4f}\t{m['Acc@0.75']:.4f}\t"
                     f"{m['Acc@0.9']:.4f}\t{blind['mIoU'] if blind else float('nan'):.4f}\t"
-                    f"{delta:.4f}\t{int(time.time()-t0)}\n")
+                    f"{delta:.4f}\t{m.get('attn_perplexity', float('nan')):.2f}\t"
+                    f"{m.get('n_keys', float('nan')):.0f}\t"
+                    f"{m.get('pos_rms_ratio', float('nan')):.5f}\t"
+                    f"{m.get('q_rate', float('nan')):.4f}\t"
+                    f"{m.get('k_rate', float('nan')):.4f}\t{int(time.time()-t0)}\n")
 
         blob = {"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch,
                 "gstep": gstep, "args": vars(args), "metrics": m}
@@ -755,7 +789,7 @@ def main_t2e(args) -> None:
     print(f"\nfinal evaluation on all {len(val_ds)} {args.val_split} samples "
           f"(best checkpoint)", flush=True)
     full, full_blind = loader(val_ds), loader(blind_ds)
-    m = evaluate_t2e(model, full, device, amp_ctx)
+    m = evaluate_t2e(model, full, device, amp_ctx, stats=True)
     b = evaluate_t2e(model, full_blind, device, amp_ctx, keep=is_hard)
     m_hard = evaluate_t2e(model, full, device, amp_ctx, keep=is_hard)
     m["blind_mIoU"] = b["mIoU"]

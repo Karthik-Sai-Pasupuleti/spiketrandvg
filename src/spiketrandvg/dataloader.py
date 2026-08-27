@@ -308,13 +308,36 @@ def rebin_time(cube: torch.Tensor, t_out: int, mode: str = "group") -> torch.Ten
 # from talk2event.py
 # ====================================================================================
 
-__all__ = ["T2E_DATA_ROOT", "Talk2Event", "make_t2e_collate", "N_ATTR", "NO_ATTR"]
+__all__ = ["T2E_DATA_ROOT", "T2E_VAL_SEQ_FILE", "Talk2Event", "make_t2e_collate",
+           "N_ATTR", "NO_ATTR", "t2e_val_sequences"]
 
 N_ATTR = len(ATTRIBUTES)
 NO_ATTR = N_ATTR                      # the "belongs to no attribute" class
 
 _WS = Path(os.environ.get("T2E_WS", Path(__file__).resolve().parents[3]))
 T2E_DATA_ROOT = Path(os.environ.get("T2E_DATA_ROOT", _WS / "dataset" / "talk2event"))
+
+# The held-out validation split. Talk2Event ships train/test only, so selecting
+# `best.pth` on `test` is model selection on the test set -- every Talk2Event number
+# recorded before 2026-08-27 was a best-of-N chosen that way. This file names 8 of the 47
+# TRAIN sequences as `val`; the split is BY SEQUENCE, so no driving scene appears in both
+# and `val` is a domain shift to unseen streets exactly as `test` is. It is written once
+# and frozen -- regenerating it would silently change what every recorded number means.
+T2E_VAL_SEQ_FILE = Path(__file__).with_name("talk2event_val_sequences.txt")
+
+
+def t2e_val_sequences(path: Path | None = None) -> frozenset[str]:
+    """The frozen `val` sequence names, from `talk2event_val_sequences.txt`."""
+    f = Path(path or T2E_VAL_SEQ_FILE)
+    if not f.exists():
+        raise FileNotFoundError(
+            f"{f} is missing. It defines the train/val split and is not regenerable "
+            f"without invalidating every number measured against it.")
+    names = frozenset(ln.strip() for ln in f.read_text().splitlines()
+                      if ln.strip() and not ln.startswith("#"))
+    if not names:
+        raise ValueError(f"{f} names no sequences")
+    return names
 
 
 def _norm(s: str) -> str:
@@ -350,7 +373,11 @@ class Talk2Event(Dataset):
     """One (object, caption) pair per item.
 
     Args:
-        split: "train" or "test".
+        split: "train", "val" or "test". `train` and `val` both read the shipped
+            train annotations and partition them BY SEQUENCE on
+            `talk2event_val_sequences.txt` -- 39 sequences (6535 samples) against 8
+            (1140), with no scene in common. `test` is the shipped test split and is
+            not touched during model selection.
         root: dataset root holding `meta_data_v10/` and `data/`.
         t_steps: event time bins. 9 is the Gate-2 setting; the npz files ship 20 bins
             and are regrouped mass-preservingly (20 -> 9 gives groups of 3,3,2,2,...).
@@ -367,10 +394,28 @@ class Talk2Event(Dataset):
         self.t_steps = t_steps
         self.caption_index = caption_index
 
-        pattern = str(self.root / f"meta_data_v10/{split}/*.json")
+        # One annotation file per driving sequence, so the train/val partition is a
+        # filter on file names -- there is no per-sample decision to get wrong, and no
+        # way for a frame of a val scene to reach train.
+        if split in ("train", "val"):
+            src, val_seqs = "train", t2e_val_sequences()
+            want_val = split == "val"
+        elif split == "test":
+            src, val_seqs, want_val = "test", frozenset(), False
+        else:
+            raise ValueError(f"unknown split {split!r}; expected train, val or test")
+
+        pattern = str(self.root / f"meta_data_v10/{src}/*.json")
         files = sorted(glob.glob(pattern))
         if not files:
             raise FileNotFoundError(f"no annotation files at {pattern}")
+        if src == "train":
+            unknown = val_seqs - {Path(f).stem for f in files}
+            if unknown:
+                raise ValueError(f"{T2E_VAL_SEQ_FILE} names sequences that do not exist "
+                                 f"in the train split: {sorted(unknown)}")
+            files = [f for f in files if (Path(f).stem in val_seqs) == want_val]
+        self.sequences = tuple(Path(f).stem for f in files)
         self.items: list[dict] = []
         for f in files:
             for rec in json.load(open(f)):
