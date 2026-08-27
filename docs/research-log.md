@@ -614,3 +614,28 @@ This is the missing half of section 12. `--attn-scale` concentrated the map (per
 4967 -> 348) without making it point anywhere useful, and perplexity alone could not
 distinguish those two outcomes. `box_mass` -- the fraction of the map's mass inside the
 true box, uniform-map baseline 0.011 -- was added for exactly that reason.
+
+## 18. Experiment record (8-epoch probes, last-3-epoch means on val)
+
+All against the frozen val split of section 10.1. `acc75` is reported but not ranked on,
+for the reason in section 14. Ladder: `acc75` (margin 0.002), else `acc50` (0.004), else
+`mIoU` (0.003). `caption_delta` has a hard floor of 0.12.
+
+| probe | lane | change | acc75 | acc50 | mIoU | delta | perplex | pos_rms | status |
+|---|---|---|---|---|---|---|---|---|---|
+| `probe_00` | — | baseline | 0.0038 | 0.1152 | 0.2319 | +0.1498 | 4967 | 0.0353 | keep |
+| `probe_01` | B | `--attn-scale 4.0` | 0.0032 | 0.1131 | 0.2312 | +0.1490 | 348 | 0.0195 | near-miss |
+| **`probe_02`** | **B** | **`--qk-lif ilif`** | **0.0055** | **0.1257** | **0.2367** | **+0.1544** | 478 | 0.0202 | **keep** |
+
+`probe_02` takes the ladder at rung 2 (acc50 +0.0105 against a 0.004 margin), is the first
+change to move all four numbers the same way, and is stable rather than spiky over its
+last three epochs (acc50 0.1246 / 0.1263 / 0.1263). Promoted to the DEFAULT, not just left
+as a flag: `eval.py` is frozen and rebuilds `Talk2EventGrounding` from a fixed kwarg list
+that does not mention `qk_lif`, so a kept change that is not the default would be silently
+absent from the final test evaluation. Anything kept on this branch has to be handled the
+same way.
+
+`probe_01` is retained as a near-miss rather than discarded, per the protocol: it moved a
+leading indicator by 14x without moving the metric, and section 17 explains why -- a
+sharper map that points in the wrong place is not progress. It is worth re-testing on top
+of `--map-weight`, which is what `probe_05` does.
