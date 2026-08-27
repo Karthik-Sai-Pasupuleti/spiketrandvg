@@ -239,6 +239,11 @@ def main() -> None:
     t2e.add_argument("--no-ilif", action="store_true",
                      help="keep binary LIF instead of integer I-LIF")
     t2e.add_argument("--freeze-event", action="store_true")
+    t2e.add_argument("--taps", nargs="+", default=["s8", "s16"],
+                     help="which encoder strides become attention keys. Default s8+s16 "
+                          "is 4800+1200 = 6000 keys at 480x640; s16 alone is 1200, which "
+                          "lowers the log(N) a softmax has to spread over by 1.6 nats "
+                          "and drops 80%% of the attention compute")
     t2e.add_argument("--pos-ratio", type=float, default=None,
                      help="pin RMS(pos) to this fraction of RMS(lateral) every forward. "
                           "Default None keeps --pos-std's init and lets the ratio drift "
@@ -656,6 +661,7 @@ def main_t2e(args) -> None:
     model = Talk2EventGrounding(
         event_ckpt=args.event_ckpt or None, event_backbone=args.event_backbone,
         text_model=args.text_model, img_size=tuple(args.size), T=args.T,
+        taps=tuple(args.taps),
         depth=args.depth, n_slots=args.n_slots, ilif=not args.no_ilif,
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
