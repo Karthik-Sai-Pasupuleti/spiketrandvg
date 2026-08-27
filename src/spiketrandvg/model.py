@@ -635,10 +635,20 @@ class SlotBoxHead(nn.Module):
         nn.init.normal_(self.res_head.weight, std=1e-3)
         nn.init.zeros_(self.res_head.bias)
 
-    def forward(self, x: torch.Tensor, hard: bool = False):
-        """x (B, d) pooled real-valued features -> box (B,4), logits (B,4,V)."""
+    def forward(self, x: torch.Tensor, hard: bool = False,
+                prior: torch.Tensor | None = None):
+        """x (B, d) pooled real-valued features -> box (B,4), logits (B,4,V).
+
+        `prior` (B,2,V) is an additive log-prior on the cx and cy slot logits -- the
+        attention map's own opinion about where the referent is, resampled onto the slot
+        grid. It is added in LOG space because that is what a softmax consumes: adding
+        log p multiplies the head's posterior by p, which is Bayes rather than a
+        heuristic blend. w and h get no prior; the map says where, not how big.
+        """
         B = x.shape[0]
         logits = self.slot_head(x).view(B, 4, self.n_slots)
+        if prior is not None:
+            logits = torch.cat([logits[:, :2] + prior, logits[:, 2:]], dim=1)
         p = logits.float().softmax(-1)
         if hard:
             coord = self.centres[p.argmax(-1)]                     # (B,4)
@@ -717,6 +727,7 @@ class Talk2EventGrounding(nn.Module):
         pos_std: float = 0.02,
         attn_scale: float | None = None,
         qk_lif: str = "binary",
+        attn_prior: bool = False,
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator
@@ -780,6 +791,14 @@ class Talk2EventGrounding(nn.Module):
         self.collect_stats = False
         self.stats: dict[str, torch.Tensor] = {}
 
+        # Zero-init, so training starts at EXACTLY the unmodified model and the prior can
+        # only be adopted if it earns gradient. Safe to zero here, unlike a head's output
+        # weight: it multiplies a log-density that is an input, not a matmul whose
+        # backward it would kill.
+        self.attn_prior = attn_prior
+        if attn_prior:
+            self.attn_prior_gain = nn.Parameter(torch.zeros(1))
+
     def _revive_attention_bn(self, gain: float) -> None:
         """tdBN-style init on the cross-attention BatchNorms. NOT optional here.
 
@@ -831,6 +850,51 @@ class Talk2EventGrounding(nn.Module):
             if isinstance(m, sj_neuron.BaseNode):
                 m.reset()
 
+    def _attn_position_prior(self, attn: torch.Tensor) -> torch.Tensor:
+        """(T,B,h,Lq,N) attention map -> (B,2,V) log-density over the cx/cy slot grids.
+
+        Why this exists
+        ---------------
+        Everything the fusion learns about WHERE the referent is has to reach the box
+        head through `proj_lif`, which is binary: the analog attention map -- the one
+        tensor in the model that is indexed by spatial position -- is quantised to 256
+        bits before the head ever sees it. This path reads the map's own spatial
+        marginals instead, and hands them to the slot head as a prior.
+
+        It is not the RefCOCO `attn_softargmax` head, which REPLACED the regressed
+        centre with the map's expectation and collapsed. A prior cannot collapse the
+        same way: at `attn_prior_gain` 0 the model is exactly the unmodified one, the
+        gain is learnable, and the slot cross-entropy trains it directly.
+
+        Both taps contribute. Each tap's marginal is converted to a DENSITY on [0,1]
+        (multiply the pmf by its own bin count) before resampling, so a 80-column s8
+        marginal and a 40-column s16 marginal are weighted by their attention mass
+        rather than by how many bins they happen to have.
+        """
+        V = self.box_head.n_slots
+        a = attn.float().mean(dim=(0, 2, 3))                    # (B,N) over T, h, Lq
+        px = a.new_zeros(a.shape[0], V)
+        py = a.new_zeros(a.shape[0], V)
+        off = 0
+        for t in self.taps:
+            h = self.img_size[0] // self.events.strides[t]
+            w = self.img_size[1] // self.events.strides[t]
+            m = a[:, off:off + h * w].view(-1, h, w)
+            off += h * w
+            mass = m.sum(dim=(1, 2)).clamp_min(1e-12)           # (B,) this tap's share
+            mx = m.sum(1) / mass[:, None] * w                   # (B,w) density on [0,1]
+            my = m.sum(2) / mass[:, None] * h                   # (B,h)
+            up = lambda d, n: F.interpolate(d[:, None], size=V, mode="linear",
+                                            align_corners=False)[:, 0]
+            px = px + mass[:, None] * up(mx, w)
+            py = py + mass[:, None] * up(my, h)
+        if off != a.shape[1]:
+            raise RuntimeError(f"taps cover {off} keys but the map has {a.shape[1]}")
+        # normalise away any drift from the interpolation, then log
+        px = px / px.mean(-1, keepdim=True).clamp_min(1e-12)
+        py = py / py.mean(-1, keepdim=True).clamp_min(1e-12)
+        return self.attn_prior_gain * torch.stack([px, py], dim=1).clamp_min(1e-8).log()
+
     def set_collect_stats(self, on: bool) -> None:
         """Turn the two leading indicators on. Eval only -- it materialises the last
         block's attention map, which the training path is careful not to keep."""
@@ -877,8 +941,9 @@ class Talk2EventGrounding(nn.Module):
         q = self.q_norm(queries).unsqueeze(0)                   # (1,B,4,d)
         v = self.v_norm(vis).unsqueeze(0)                       # (1,B,N,d)
         attn = None
+        need_attn = self.collect_stats or self.attn_prior
         for i, blk in enumerate(self.blocks):
-            if self.collect_stats and i == len(self.blocks) - 1:
+            if need_attn and i == len(self.blocks) - 1:
                 q, attn = blk(q, v, return_attn=True)
             else:
                 q = blk(q, v)
@@ -898,7 +963,8 @@ class Talk2EventGrounding(nn.Module):
                 self.stats[k_] = v_
 
         pooled = self.head_norm(q.mean(dim=1))                  # (B,d)
-        box, slot_logits = self.box_head(pooled)
+        prior = self._attn_position_prior(attn) if self.attn_prior else None
+        box, slot_logits = self.box_head(pooled, prior=prior)
         return {"box": box, "slot_logits": slot_logits, "tag_logits": tag_logits}
 
     @torch.no_grad()

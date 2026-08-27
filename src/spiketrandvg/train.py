@@ -239,6 +239,12 @@ def main() -> None:
     t2e.add_argument("--no-ilif", action="store_true",
                      help="keep binary LIF instead of integer I-LIF")
     t2e.add_argument("--freeze-event", action="store_true")
+    t2e.add_argument("--attn-prior", action="store_true",
+                     help="feed the attention map's spatial marginals to SlotBoxHead as "
+                          "a learnable-gain log-prior on the cx/cy slots. Zero-init, so "
+                          "it starts as exactly the unmodified model. This is the only "
+                          "path by which the analog attention map reaches the box head "
+                          "without first being binarised by proj_lif")
     t2e.add_argument("--qk-lif", default="binary", choices=["binary", "ilif"],
                      help="activation on the attention's q and k projections. binary: "
                           "CMSF's Dynamic_Threshold_LIFNode, {0,1}. ilif: SpikeYOLO's "
@@ -644,6 +650,7 @@ def main_t2e(args) -> None:
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
         pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
+        attn_prior=args.attn_prior,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
