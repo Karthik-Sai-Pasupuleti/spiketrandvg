@@ -728,6 +728,7 @@ class Talk2EventGrounding(nn.Module):
         attn_scale: float | None = None,
         qk_lif: str = "binary",
         attn_prior: bool = False,
+        attn_prior_gain: float = 0.0,
         pos_ratio: float | None = None,
     ):
         super().__init__()
@@ -798,7 +799,7 @@ class Talk2EventGrounding(nn.Module):
         # backward it would kill.
         self.attn_prior = attn_prior
         if attn_prior:
-            self.attn_prior_gain = nn.Parameter(torch.zeros(1))
+            self.attn_prior_gain = nn.Parameter(torch.full((1,), attn_prior_gain))
 
         # Pin RMS(pos) to a fixed fraction of RMS(lateral) on every forward, instead of
         # letting it be whatever a fixed init std happens to leave behind.
@@ -979,6 +980,9 @@ class Talk2EventGrounding(nn.Module):
                                             / torch.stack(lat_ms).mean().sqrt().clamp_min(1e-12))}
             for k_, v_ in self.blocks[-1].attn.last_rates.items():
                 self.stats[k_] = v_
+            if self.attn_prior:
+                # a gain still at its init means the head never found the map useful
+                self.stats["prior_gain"] = self.attn_prior_gain.detach().squeeze()
 
         pooled = self.head_norm(q.mean(dim=1))                  # (B,d)
         prior = self._attn_position_prior(attn) if self.attn_prior else None

@@ -251,6 +251,10 @@ def main() -> None:
                           "it starts as exactly the unmodified model. This is the only "
                           "path by which the analog attention map reaches the box head "
                           "without first being binarised by proj_lif")
+    t2e.add_argument("--attn-prior-gain", type=float, default=0.0,
+                     help="initial value of the learnable prior gain. 0.0 starts at "
+                          "exactly the unmodified model; a positive value warm-starts "
+                          "it, which matters only if the gain turns out not to move")
     t2e.add_argument("--qk-lif", default="binary", choices=["binary", "ilif"],
                      help="activation on the attention's q and k projections. binary: "
                           "CMSF's Dynamic_Threshold_LIFNode, {0,1}. ilif: SpikeYOLO's "
@@ -656,7 +660,8 @@ def main_t2e(args) -> None:
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
         pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
-        attn_prior=args.attn_prior, pos_ratio=args.pos_ratio,
+        attn_prior=args.attn_prior, attn_prior_gain=args.attn_prior_gain,
+        pos_ratio=args.pos_ratio,
     ).to(device)
     crit = SingleBoxLoss(center_weight=args.center_weight).to(device)
 
