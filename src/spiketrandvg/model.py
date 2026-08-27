@@ -511,3 +511,283 @@ class RefCOCOGrounding(nn.Module):
 
 def build_model(**kwargs) -> RefCOCOGrounding:
     return RefCOCOGrounding(**kwargs)
+
+
+# ======================================================================================
+# Talk2Event: event-only, language-conditioned, slot-based box selection
+# ======================================================================================
+
+class SlotBoxHead(nn.Module):
+    """Four coordinate tokens, each a V-way choice plus a within-slot residual.
+
+        forward(tokens) -> (box (B,4) normalised cxcywh, logits (B,4,V))
+
+    Why choose instead of regress
+    -----------------------------
+    This is the Gate-1 finding turned into an architecture. A binary/integer spiking
+    encoder cannot hand a regression head a smooth field to interpolate a sub-pixel
+    coordinate out of -- the RefCOCO study measured the consequence directly: Acc@0.25
+    71% but Acc@0.75 only 8%, i.e. roughly the right region, rarely the right box. A
+    spike count picking a winner from a list is a far better-posed problem for this kind
+    of encoder than asking it to emit a precise real number.
+
+    Predicting in the ANNOTATION frame, not the feature frame
+    ---------------------------------------------------------
+    The V slots discretise the normalised [0,1] coordinate range, which maps to the
+    480x640 annotation frame -- NOT to the stride-16 feature grid. At V=1000 a slot is
+    0.64 px wide in x and 0.48 px in y, so the feature map's 30x40 resolution never caps
+    achievable precision. That is the whole point of decoupling them; a head that argmaxes
+    over feature cells would be stuck at 16 px granularity.
+
+    The residual
+    ------------
+    `expectation` (default) reads the coordinate as the softmax-weighted mean of slot
+    centres, which is differentiable everywhere and already sub-slot. The residual head
+    then adds a tanh-bounded correction of at most one slot width. Hard argmax is
+    available for inference-time reporting but is not differentiable and is not the
+    training path.
+    """
+
+    def __init__(self, d_model: int, n_slots: int = 1000, hidden: int = 512):
+        super().__init__()
+        self.n_slots = n_slots
+        # one head per coordinate: cx, cy, w, h
+        self.slot_head = nn.Linear(d_model, 4 * n_slots)
+        self.res_head = nn.Linear(d_model, 4)
+        # slot centres in [0,1]; a buffer so it moves with .to(device) and is saved
+        self.register_buffer(
+            "centres", (torch.arange(n_slots, dtype=torch.float32) + 0.5) / n_slots)
+        nn.init.normal_(self.slot_head.weight, std=1e-3)
+        nn.init.zeros_(self.slot_head.bias)
+        nn.init.normal_(self.res_head.weight, std=1e-3)
+        nn.init.zeros_(self.res_head.bias)
+
+    def forward(self, x: torch.Tensor, hard: bool = False):
+        """x (B, d) pooled real-valued features -> box (B,4), logits (B,4,V)."""
+        B = x.shape[0]
+        logits = self.slot_head(x).view(B, 4, self.n_slots)
+        p = logits.float().softmax(-1)
+        if hard:
+            coord = self.centres[p.argmax(-1)]                     # (B,4)
+        else:
+            coord = (p * self.centres).sum(-1)                     # (B,4) expectation
+        res = torch.tanh(self.res_head(x).float()) / self.n_slots  # <= one slot
+        box = (coord + res).clamp(0, 1)
+        # w and h must be positive and are meaningless at 0; clamp to one slot minimum
+        wh = box[:, 2:].clamp(min=1.0 / self.n_slots)
+        return torch.cat([box[:, :2], wh], dim=-1), logits
+
+
+class Talk2EventGrounding(nn.Module):
+    """Event-only spike-driven referring grounding.
+
+        forward(cube, input_ids, attention_mask)
+            -> {"box": (B,4), "slot_logits": (B,4,V), "tag_logits": (B,L,5)}
+
+        events (T=9,B,2,480,640)                caption ids (B,L)
+                 |                                     |
+                 |                          TextEncoder (roberta, FROZEN)
+                 |                                     |
+                 |                          AttributeQueryTagger -> 4 sub-queries
+                 |                                     |
+                 |  <--- ThresholdModulator sets firing thresholds, stages 2-4
+                 v
+          EventEncoder (Meta-SpikeFormer, T=9 real timesteps, I-LIF)
+                 |
+            ACCUMULATE over T   <-- binary/integer ends here, real numbers resume
+                 |
+          lateral 1x1 + learnable 2D position -> vision tokens
+                 |
+          SpatialCrossAttention (Q = the 4 sub-queries)  x depth
+                 |
+          SlotBoxHead: 4 coordinate tokens over V=1000 slots + residual
+                 |
+             ONE box (B,4) normalised cxcywh
+
+    Why there is no RGB branch here
+    -------------------------------
+    Deliberate, and the single most important design decision in this class. The novelty
+    claim is spike-driven referring grounding *on event streams*. Talk2Event's own
+    baselines are frame-only 55.47 vs event-only 31.96 mAcc, so a fused model's headline
+    number is mostly the frame encoder, and the contribution disappears underneath it.
+    The per-attribute analysis this architecture exists to support also only means
+    anything if event-only and frame-only are separate rows -- fusion is a third row, not
+    the headline.
+
+    When fusion IS added for completeness against the benchmark's third column, the RGB
+    branch should be an **ANN, not spiking**. The spiking claim concerns the event
+    pathway, where the sensor is. Spiking an RGB branch buys nothing scientifically,
+    doubles training memory, and adds a confound to every ablation.
+    `vision_encoder.VisionEncoder` remains in the codebase for exactly that row.
+    """
+
+    def __init__(
+        self,
+        event_ckpt: str | None = None,
+        text_model: str = "roberta-base",
+        d_model: int = 256,
+        img_size: tuple[int, int] = (480, 640),
+        T: int = 9,
+        taps: tuple[str, ...] = ("s8", "s16"),
+        depth: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+        n_slots: int = 1000,
+        ilif: bool = True,
+        condition_encoder: bool = True,
+        freeze_event: bool = False,
+        freeze_text: bool = True,
+        text_unfreeze_last: int = 0,
+        max_log_gain: float = 0.5,
+        attn_bn_gain: float = 3.0,
+    ):
+        super().__init__()
+        from spiketrandvg.event_encoder import EventEncoder, ThresholdModulator
+        from spiketrandvg.text_encoder import ATTRIBUTES, AttributeQueryTagger
+
+        if img_size[0] % 16 or img_size[1] % 16:
+            raise ValueError(f"img_size {img_size} must be divisible by 16")
+        self.T = T
+        self.d_model = d_model
+        self.img_size = tuple(img_size)
+        self.taps = tuple(taps)
+        self.n_attr = len(ATTRIBUTES)
+
+        self.events = EventEncoder(ckpt_path=event_ckpt, taps=self.taps, in_channels=2,
+                                   ilif=ilif, freeze=freeze_event)
+        self.text = TextEncoder(text_model, d_model=d_model, freeze=freeze_text,
+                                unfreeze_last=text_unfreeze_last)
+        self.tagger = AttributeQueryTagger(d_model=d_model, n_attr=self.n_attr)
+
+        self.condition_encoder = condition_encoder
+        self.modulator = (ThresholdModulator(d_model, self.events.stage_channels,
+                                             max_log_gain=max_log_gain)
+                          if condition_encoder else None)
+
+        # post-accumulator projections: the tensors here are REAL-VALUED spike counts
+        ch = self.events.out_channels
+        self.lateral = nn.ModuleDict(
+            {t: nn.Conv2d(ch[t], d_model, kernel_size=1) for t in self.taps})
+        self.tap_norm = nn.ModuleDict({t: nn.BatchNorm2d(ch[t]) for t in self.taps})
+        self.pos = nn.ParameterDict({
+            t: nn.Parameter(torch.zeros(
+                1, d_model, img_size[0] // self.events.strides[t],
+                img_size[1] // self.events.strides[t]))
+            for t in self.taps})
+        for p in self.pos.values():
+            nn.init.trunc_normal_(p, std=0.02)
+        self.level = nn.Parameter(torch.zeros(len(self.taps), d_model))
+        nn.init.trunc_normal_(self.level, std=0.02)
+
+        # the head still cross-attends -- conditioning the encoder ADDS a pathway, it
+        # does not replace this one
+        self.blocks = nn.ModuleList(
+            [SpatialBlock(d_model, num_heads, mlp_ratio) for _ in range(depth)])
+        self._revive_attention_bn(attn_bn_gain)
+        self.q_norm = nn.LayerNorm(d_model)
+        self.v_norm = nn.LayerNorm(d_model)
+        self.head_norm = nn.LayerNorm(d_model)
+        self.box_head = SlotBoxHead(d_model, n_slots=n_slots)
+
+    def _revive_attention_bn(self, gain: float) -> None:
+        """tdBN-style init on the cross-attention BatchNorms. NOT optional here.
+
+        MEASURED on this model: at PyTorch's default BN gain of 1.0, `q_lif` and
+        `proj_lif` fire at exactly 0.00% and stay there. With `proj_lif` dead the block's
+        residual `x + attn(x, y, y)` collapses to `x`, so the vision branch contributes
+        nothing and `lateral`/`ThresholdModulator` receive exactly zero gradient. A
+        41-step fit on 2 samples reached IoU 0.9964 in that state -- entirely through the
+        language path, memorising the caption. Both the conditioning pathway and the
+        event encoder were inert while the loss looked excellent.
+
+        This is research-log finding 1 in a place its original guard did not reach:
+        `RefCOCOGrounding._scale_attention_bn` skips `spatial_softmax` on the reasoning
+        that softmax cannot die. The softmax indeed cannot, but the LIFs around it can.
+        RefCOCO survived it because 7539 steps/epoch let BatchNorm running statistics
+        drift the pre-activations over threshold eventually (measured 7-40% firing by
+        epoch 18); a small event-side run has no such runway and settles into the
+        language-only solution first.
+
+        RefCOCOGrounding's behaviour is deliberately NOT changed -- `runs/refcoco_b1` and
+        the in-flight full run were trained without this, and altering it would break
+        comparability.
+        """
+        for blk in self.blocks:
+            for bn in (blk.attn.q_bn, blk.attn.k_bn, blk.attn.v_bn, blk.attn.proj_bn):
+                nn.init.constant_(bn.weight, gain)
+
+    def trainable_parameters(self) -> dict[str, int]:
+        g = {
+            "events.backbone": self.events.backbone,
+            "text.encoder": self.text.encoder,
+            "text.proj": self.text.proj,
+            "tagger": self.tagger,
+            "lateral+norm": nn.ModuleList([self.lateral, self.tap_norm]),
+            "fusion": self.blocks,
+            "box_head": self.box_head,
+        }
+        out = {k: sum(p.numel() for p in m.parameters() if p.requires_grad)
+               for k, m in g.items()}
+        if self.modulator is not None:
+            out["modulator"] = sum(p.numel() for p in self.modulator.parameters()
+                                   if p.requires_grad)
+        out["pos+level"] = (sum(p.numel() for p in self.pos.values())
+                            + self.level.numel())
+        return {k: v for k, v in out.items() if v}
+
+    def reset(self) -> None:
+        for m in self.modules():
+            if isinstance(m, sj_neuron.BaseNode):
+                m.reset()
+
+    def forward(self, cube, input_ids, attention_mask):
+        if cube.dim() != 5 or cube.shape[0] != self.T:
+            raise ValueError(f"expected (T={self.T},B,2,H,W) cube, got {tuple(cube.shape)}")
+        if cube.shape[1] != input_ids.shape[0]:
+            raise ValueError(f"batch mismatch {cube.shape[1]} vs {input_ids.shape[0]}")
+        self.reset()
+
+        # --- language first: the encoder must know what is being asked ---------
+        txt = self.text(input_ids, attention_mask)              # (B,L,d)
+        queries, tag_logits = self.tagger(txt, attention_mask)  # (B,4,d), (B,L,5)
+        gains = self.modulator(queries) if self.modulator is not None else None
+
+        # --- conditioned spiking encoder, then the accumulator -----------------
+        feats = self.events(cube, gains=gains)                  # {tap:(T,B,C,h,w)}
+        pooled_feats = self.events.accumulate(feats)            # {tap:(B,C,h,w)} REAL
+
+        toks = []
+        for i, t in enumerate(self.taps):
+            f = self.tap_norm[t](pooled_feats[t])
+            x = self.lateral[t](f)                              # (B,d,h,w)
+            pos = self.pos[t]
+            if pos.shape[-2:] != x.shape[-2:]:
+                pos = nn.functional.interpolate(pos, size=x.shape[-2:],
+                                                mode="bilinear", align_corners=False)
+            x = x + pos + self.level[i].view(1, -1, 1, 1)
+            B, d, h, w = x.shape
+            toks.append(x.reshape(B, d, h * w).permute(0, 2, 1))
+        vis = torch.cat(toks, dim=1)                            # (B,N,d)
+
+        # SpatialBlock expects a leading T axis; downstream of the accumulator there is
+        # no time left, so run it as T=1 -- one real-valued step, not a spiking one.
+        q = self.q_norm(queries).unsqueeze(0)                   # (1,B,4,d)
+        v = self.v_norm(vis).unsqueeze(0)                       # (1,B,N,d)
+        for blk in self.blocks:
+            q = blk(q, v)
+        q = q.squeeze(0)                                        # (B,4,d)
+
+        pooled = self.head_norm(q.mean(dim=1))                  # (B,d)
+        box, slot_logits = self.box_head(pooled)
+        return {"box": box, "slot_logits": slot_logits, "tag_logits": tag_logits}
+
+    @torch.no_grad()
+    def predict(self, cube, input_ids, attention_mask, amp: bool = True):
+        was = self.training
+        self.eval()
+        ctx = (torch.autocast("cuda", dtype=torch.bfloat16) if amp and cube.is_cuda
+               else torch.autocast("cpu", enabled=False))
+        with ctx:
+            out = self(cube, input_ids, attention_mask)
+        self.train(was)
+        return out["box"].float()

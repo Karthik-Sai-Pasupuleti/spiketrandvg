@@ -28,7 +28,14 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
-__all__ = ["MAX_TEXT_LEN", "TOKENIZER_NAME", "TextEncoder", "build_tokenizer"]
+__all__ = ["MAX_TEXT_LEN", "TOKENIZER_NAME", "TextEncoder", "build_tokenizer",
+           "ATTRIBUTES", "AttributeQueryTagger"]
+
+# Talk2Event annotates every caption with phrases under exactly these four headings.
+# They are the dataset's own labels, not a taxonomy invented here -- see
+# `talk2event.py`, which locates each phrase back in the caption to build token-level
+# supervision for the tagger below.
+ATTRIBUTES = ("appearance", "status", "relation_viewer", "relation_others")
 
 TOKENIZER_NAME = "roberta-base"
 
@@ -106,3 +113,66 @@ class TextEncoder(nn.Module):
             hidden = self.encoder(input_ids=input_ids,
                                   attention_mask=attention_mask).last_hidden_state
         return self.proj(hidden)                       # (B, L, d_model)
+
+
+class AttributeQueryTagger(nn.Module):
+    """Caption -> four attribute sub-queries, via a learned per-token span tagger.
+
+        forward(tokens, attention_mask) -> (queries (B,4,d), logits (B,L,5))
+
+    Instead of pooling the caption into ONE vector, every token is tagged with which of
+    the four Talk2Event attributes it belongs to (or none), and tokens are pooled per
+    attribute into `q_appearance`, `q_status`, `q_viewer`, `q_others`.
+
+    Why four and not one
+    --------------------
+    The four attributes ask for different evidence from the scene. "A dark-coloured car"
+    is an appearance question; "driving" is a motion question; "on the right side of the
+    road" is a viewer-relative geometry question. A single pooled vector cannot tell the
+    encoder which of those it is being asked, so it cannot condition on it -- and
+    conditioning is the point (see `ThresholdModulator`).
+
+    It is also a clean single-variable ablation against EventRefer, which recovers the
+    same four groups by fuzzy string-matching the raw caption at data-loading time. Here
+    they are *learned*, supervised by spans that the dataset already provides, so the
+    tagger can generalise to phrasings the string matcher misses.
+
+    Soft pooling, not hard
+    ----------------------
+    Pooling uses the softmax posterior rather than an argmax, so the whole path stays
+    differentiable and a token that is genuinely ambiguous ("parked" is both status and
+    appearance-ish) contributes to both queries in proportion. `logits` is returned so
+    the trainer can add the auxiliary cross-entropy against the dataset's spans; without
+    that loss the tagger is free to learn any partition it likes, which is a valid
+    ablation but no longer "the four attributes".
+    """
+
+    def __init__(self, d_model: int = 256, n_attr: int = len(ATTRIBUTES)):
+        super().__init__()
+        self.n_attr = n_attr
+        # n_attr + 1: the extra class is "belongs to no attribute", which most tokens
+        # (articles, prepositions, the object noun itself) legitimately are.
+        self.tag = nn.Linear(d_model, n_attr + 1)
+        # Learned fallback for an attribute with no tokens assigned to it -- common,
+        # since not every caption mentions all four. Zero would push a meaningless
+        # all-zeros vector into cross-attention; a learned token says "not asked".
+        self.null_query = nn.Parameter(torch.zeros(n_attr, d_model))
+        nn.init.trunc_normal_(self.null_query, std=0.02)
+
+    def forward(self, tokens: torch.Tensor, attention_mask: torch.Tensor):
+        """tokens (B,L,d) from TextEncoder; attention_mask (B,L)."""
+        if tokens.dim() != 3:
+            raise ValueError(f"expected (B,L,d) tokens, got {tuple(tokens.shape)}")
+        logits = self.tag(tokens)                                  # (B,L,n_attr+1)
+        mask = attention_mask.to(tokens.dtype).unsqueeze(-1)       # (B,L,1)
+
+        # padded positions must not win any attribute's pooling weight
+        p = logits.softmax(-1)[..., :self.n_attr] * mask           # (B,L,n_attr)
+        w = p.transpose(1, 2)                                      # (B,n_attr,L)
+        denom = w.sum(-1, keepdim=True)                            # (B,n_attr,1)
+        pooled = torch.bmm(w, tokens) / denom.clamp(min=1e-6)      # (B,n_attr,d)
+
+        # where an attribute drew essentially no mass, substitute the learned null query
+        empty = (denom < 1e-4).to(tokens.dtype)                    # (B,n_attr,1)
+        queries = pooled * (1 - empty) + self.null_query[None] * empty
+        return queries, logits
