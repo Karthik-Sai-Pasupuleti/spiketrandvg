@@ -592,7 +592,7 @@ class Talk2EventGrounding(nn.Module):
         forward(cube, input_ids, attention_mask)
             -> {"box": (B,4), "slot_logits": (B,4,V), "tag_logits": (B,L,5)}
 
-        events (T=9,B,2,480,640)                caption ids (B,L)
+        events (T=5,B,2,480,640)                caption ids (B,L)
                  |                                     |
                  |                          TextEncoder (roberta, FROZEN)
                  |                                     |
@@ -600,7 +600,7 @@ class Talk2EventGrounding(nn.Module):
                  |                                     |
                  |  <--- ThresholdModulator sets firing thresholds, stages 2-4
                  v
-          EventEncoder (Meta-SpikeFormer, T=9 real timesteps, I-LIF)
+          EventEncoder (SpiLiFormer-DVS, T=5 real timesteps, I-LIF)
                  |
             ACCUMULATE over T   <-- binary/integer ends here, real numbers resume
                  |
@@ -635,7 +635,7 @@ class Talk2EventGrounding(nn.Module):
         text_model: str = "roberta-base",
         d_model: int = 256,
         img_size: tuple[int, int] = (480, 640),
-        T: int = 9,
+        T: int = 5,
         taps: tuple[str, ...] = ("s8", "s16"),
         depth: int = 2,
         num_heads: int = 8,
@@ -648,7 +648,7 @@ class Talk2EventGrounding(nn.Module):
         text_unfreeze_last: int = 0,
         max_log_gain: float = 0.5,
         attn_bn_gain: float = 3.0,
-        event_backbone: str = "metaspikformer",
+        event_backbone: str = "spiliformer_dvs",
     ):
         super().__init__()
         from spiketrandvg.visionencoder import EventEncoder, ThresholdModulator

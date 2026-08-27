@@ -58,7 +58,11 @@ POLARITIES = 2
 # file bins: equal step durations, integer counts, and no interpolation assumption.
 # (T=4 was considered and rejected: 10/4 = 2.5, which forces either unequal step
 # durations or fractional splitting of a bin whose sub-structure is already lost.)
-T_STEPS = 9
+# 5 timesteps over the file's 10 native time bins: an exact 2-bins-per-step grouping,
+# so the rebin is mass-preserving with no uneven groups (T=9 needed [3,3,2,2,2,2,2,2,2]).
+# Each step keeps the 2 polarity channels, giving (5, 2, 480, 640) -- 5 x 2 = the 10
+# planes the raw file carries per polarity pair.
+T_STEPS = 5
 
 
 def events_to_coords_feats(

@@ -1,8 +1,10 @@
 """Vision encoders: a spiking event encoder and a spiking RGB encoder.
 
-  `EventEncoder`   Meta-SpikeFormer over event voxel cubes. The main pathway for
-                   Talk2Event -- T=9 real timesteps, I-LIF integer activations, and
-                   firing thresholds modulated by language (`ThresholdModulator`).
+  `EventEncoder`   Spiking backbone over event voxel cubes -- the main pathway for
+                   Talk2Event. Two interchangeable backbones (`spiliformer_dvs`,
+                   default, and `metaspikformer`), T=5 real timesteps, I-LIF integer
+                   activations, and firing thresholds modulated by language
+                   (`ThresholdModulator`).
 
   `VisionEncoder`  SpiLiFormer over an RGB frame. The main pathway for RefCOCO, and the
                    branch a Talk2Event fusion row would use -- though for that row it
@@ -122,11 +124,14 @@ class ThresholdModulator(nn.Module):
 
 
 class EventEncoder(nn.Module):
-    """Meta-SpikeFormer over event cubes, multi-scale taps, optionally conditioned.
+    """Spiking backbone over event cubes, multi-scale taps, optionally conditioned.
 
     Args:
-        ckpt_path: Meta-SpikeFormer ImageNet checkpoint. Its 3-channel RGB stem is
-            averaged and repeated onto the 2 event-polarity channels.
+        backbone: "spiliformer_dvs" (default, 1.70M, event-native in_channels=2, NO
+            published checkpoint so it starts from random init) or "metaspikformer"
+            (54.71M, ImageNet-pretrained with its RGB stem averaged onto 2 channels).
+            Both give the same tap geometry at 480x640, so they are a one-flag A/B.
+        ckpt_path: checkpoint for the chosen backbone. Only metaspikformer has one.
         taps: which strides to return.
         ilif: replace the backbone's binary LIF with SpikeYOLO's integer I-LIF.
         freeze: run the backbone under no_grad.
@@ -134,9 +139,9 @@ class EventEncoder(nn.Module):
 
     Memory (measured, 480x640, 32 GiB card, T=5): trainable backbone needs 16.0 GiB at
     B=1 and OOMs at B=2, because activations for every timestep are kept for backward.
-    **T=9 raises this roughly 1.8x over T=5**, so a trainable backbone at T=9 will not
-    fit at B=1 on 32 GiB -- expect to freeze the backbone, tune only the later stages,
-    or accumulate gradients. Frozen it runs at inference cost (3.6 GiB at B=1, T=5).
+    At T=5 with the 1.70M spiliformer_dvs backbone the whole model trains unfrozen in
+    3.1 GiB at B=2; the 54.7M metaspikformer is the one that needs freezing, and frozen it
+    runs at inference cost (3.6 GiB at B=1).
 
     Gradient checkpointing is deliberately NOT offered: recomputation re-runs stateful
     LIF neurons whose membranes have already advanced, silently producing different
@@ -369,7 +374,7 @@ class EventEncoder(nn.Module):
             #
             # The cost is real: a conditioned frozen backbone must still build the
             # activation graph for all T steps, so it is priced like a trainable one
-            # (~16 GiB at B=1, T=5; more at T=9) rather than like inference. Only the
+            # (~16 GiB at B=1 for metaspikformer) rather than like inference. Only the
             # PARAMETERS stay fixed. Pass `condition_encoder=False` to get the cheap path.
             no_grad = self.frozen and gains is None
             ctx = torch.no_grad() if no_grad else contextlib.nullcontext()
