@@ -264,12 +264,13 @@ def main() -> None:
                      help="initial value of the learnable prior gain. 0.0 starts at "
                           "exactly the unmodified model; a positive value warm-starts "
                           "it, which matters only if the gain turns out not to move")
-    t2e.add_argument("--qk-lif", default="binary", choices=["binary", "ilif"],
+    t2e.add_argument("--qk-lif", default="ilif", choices=["binary", "ilif"],
                      help="activation on the attention's q and k projections. binary: "
                           "CMSF's Dynamic_Threshold_LIFNode, {0,1}. ilif: SpikeYOLO's "
                           "integer mem_update, {0..4} -- still a LIF, and the one that "
                           "breaks the tie floor a binary dot product imposes on the "
-                          "softmax. See SpatialCrossAttention.__init__")
+                          "softmax. See SpatialCrossAttention.__init__. DEFAULT since "
+                          "probe_02; `binary` is now the ablation")
     t2e.add_argument("--attn-scale", type=float, default=None,
                      help="softmax temperature in SpatialCrossAttention. Default None "
                           "= dh**-0.5, the analog-q/k transformer value. q and k are "

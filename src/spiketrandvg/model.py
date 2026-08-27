@@ -726,7 +726,7 @@ class Talk2EventGrounding(nn.Module):
         event_backbone: str = "spiliformer_dvs",
         pos_std: float = 0.02,
         attn_scale: float | None = None,
-        qk_lif: str = "binary",
+        qk_lif: str = "ilif",
         attn_prior: bool = False,
         attn_prior_gain: float = 0.0,
         pos_ratio: float | None = None,
