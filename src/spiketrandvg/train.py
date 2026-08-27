@@ -256,10 +256,12 @@ def main() -> None:
                           "it starts as exactly the unmodified model. This is the only "
                           "path by which the analog attention map reaches the box head "
                           "without first being binarised by proj_lif")
-    t2e.add_argument("--map-weight", type=float, default=0.0,
+    t2e.add_argument("--map-weight", type=float, default=1.0,
                      help="weight on -log(attention mass inside the true box). Nothing "
                           "else supervises WHERE the map points: the box loss reaches "
-                          "it only through proj_lif, which is binary. 0 disables")
+                          "it only through proj_lif, which is binary. DEFAULT since "
+                          "probe_04; 0 is the ablation. Unlike the architecture flags "
+                          "this one is training-only, so eval.py needs no counterpart")
     t2e.add_argument("--attn-prior-gain", type=float, default=0.0,
                      help="initial value of the learnable prior gain. 0.0 starts at "
                           "exactly the unmodified model; a positive value warm-starts "
