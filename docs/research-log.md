@@ -911,3 +911,46 @@ model's 0.3589), but it is now specifically a HORIZONTAL discrimination problem:
 the referent out of several similar vehicles strung along a road, rather than resolving a
 position at all. The s8 tap gives 8 px columns, so 19.6 px is about 2.5 cells -- not a
 resolution ceiling, which points at feature discriminability rather than at the map.
+
+## 25. The matched-budget comparison
+
+`baseline_60` is the pre-branch architecture (`--qk-lif binary --map-weight 0
+--no-attn-prior --pos-ratio 0`) at the same `--epochs 60 --patience 20` as `promote_01`.
+It exists so the headline cannot conflate these changes with the extra epochs.
+
+| val, 60-epoch budget | `baseline_60` | **`promote_01`** | |
+|---|---|---|---|
+| mIoU | 0.2387 | **0.3479** | +45.8% |
+| Acc@0.25 | 0.4404 | **0.6193** | +40.6% |
+| Acc@0.5 | 0.1289 | **0.3360** | **2.61x** |
+| Acc@0.75 | 0.0096 | **0.0579** | **6.0x** |
+| Acc@0.9 | 0.0009 | 0.0018 | 1 vs 2 samples -- noise, ignore |
+| caption_delta | +0.1606 | **+0.2496** | +0.089 |
+| blind mIoU | 0.0713 | 0.0970 | |
+
+Acc@0.75 is 66 samples of 1140 against 11 -- a 6.7 SE difference, comfortably clear of the
+noise floor that made section 14 necessary. Acc@0.9 is 2 samples against 1 and means
+nothing; it is in the table only so nobody quotes it.
+
+### 25.1 The baseline does not merely score lower, it stops learning
+
+| | epochs run | best epoch | final train-IoU |
+|---|---|---|---|
+| `baseline_60` | 32 (early stop) | **11** | 0.568 |
+| `promote_01` | 60 (no early stop) | **55** | 0.791 |
+
+The baseline peaks at epoch 11 of a 60-epoch schedule and is stopped at 32, with val mIoU
+having fallen from 0.2387 to 0.1960 while train-IoU climbed to 0.568. The promoted model
+is still setting bests at epoch 55.
+
+This reframes the original diagnosis. The starting note said the model was overfitting and
+that capacity applied naively would make it worse, and that was right -- but the reason it
+overfits at epoch 11 is that **there is nothing else for it to learn**. With a uniform
+attention map, position cannot reach the box head at all (section 11), so beyond a coarse
+caption-to-region prior the only direction left is memorisation. Giving the map a gradient
+for WHERE it points and a path to the head does not just raise the ceiling; it gives the
+optimiser somewhere to go for another 44 epochs.
+
+That is also why the 8-epoch probe budget worked as a ranking signal but understated every
+kept change: the baseline has ~98% of its final signal by epoch 5, and the fixed model does
+not.
