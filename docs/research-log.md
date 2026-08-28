@@ -848,3 +848,66 @@ Caveats that have to travel with it: this is one 8-epoch optimiser trajectory, t
 it came from did not improve accuracy, and nothing here rules out the weights having
 collapsed onto `status` for a reason unrelated to localisation. It needs replication at a
 longer budget and across seeds before it is more than an observation.
+
+## 24. Promotion, and what the error looks like afterwards
+
+`promote_01` is `probe_10`'s configuration at `--epochs 60 --patience 20`. It ran all 60
+epochs without early stopping. Best checkpoint (epoch 55), full 1140-sample val:
+
+| | 8-epoch probe | **60-epoch promoted** |
+|---|---|---|
+| mIoU | 0.3090 | **0.3479** |
+| Acc@0.25 | — | **0.6193** |
+| Acc@0.5 | 0.2544 | **0.3360** |
+| Acc@0.75 | 0.0325 | **0.0579** |
+| caption_delta | +0.2113 | **+0.2496** |
+| box_mass | 40.5x | **49.9x chance** |
+| learned prior gain | 0.873 | **1.885** |
+
+Eight epochs understated it, as section 22 expected. train-IoU reached 0.79 against a val
+mIoU that plateaued around 0.344 from epoch 31, so the run is overfitting in its second
+half -- but val never degraded, and the best epoch is 55 of 60.
+
+**A 60-epoch run cannot be compared to an 8-epoch baseline.** A matched-budget control
+(`--qk-lif binary --map-weight 0 --no-attn-prior --pos-ratio 0`, 60 epochs) is running for
+exactly that reason; without it the headline would conflate these changes with the extra
+epochs.
+
+### 24.1 The map is now as good as the head it advises
+
+`tools/oracle.py` on `promote_01`, against the same tool on `probe_01` before any of this:
+
+| | `probe_01` (before) | `promote_01` (after) |
+|---|---|---|
+| model mIoU | 0.2351 | 0.3589 |
+| MAP centre + pred size, mIoU | **0.0627** | **0.3457** |
+| MAP centre error, median | **110.7 px** | **26.1 px** |
+| model centre error, median | 46.0 px | 23.6 px |
+
+Reading the box straight off the attention map now very nearly reproduces the whole model
+(0.3457 against 0.3589). Before, the map was so wrong that using it cost two thirds of the
+score. That is the entire thesis of sections 19-22 in one row.
+
+### 24.2 What is left is horizontal, and only horizontal
+
+| oracle | mIoU | Acc@0.5 | Acc@0.75 |
+|---|---|---|---|
+| model | 0.3589 | 0.3579 | 0.0632 |
+| pred centre + TRUE size | 0.4158 | 0.4649 | 0.1561 |
+| **TRUE centre + pred size** | **0.6352** | **0.7596** | **0.3333** |
+| TRUE cx only | 0.5675 | 0.6526 | 0.2053 |
+| TRUE cy only | 0.3926 | 0.4175 | 0.1123 |
+
+Median per-axis error: **|cx| 19.6 px, |cy| 5.4 px**, against the 6.7 px an IoU of 0.75
+allows on a median box.
+
+**cy is already inside tolerance. cx is three times outside it.** Vertical placement is
+effectively solved, which section 17 anticipated -- objects in driving scenes sit in a
+narrow band around the horizon (gt cy std 0.043 against cx std 0.233), so cy is close to a
+constant and cx is where the object actually has to be found.
+
+The centre is still the whole error (a true centre would give mIoU 0.6352 against the
+model's 0.3589), but it is now specifically a HORIZONTAL discrimination problem: picking
+the referent out of several similar vehicles strung along a road, rather than resolving a
+position at all. The s8 tap gives 8 px columns, so 19.6 px is about 2.5 cells -- not a
+resolution ceiling, which points at feature discriminability rather than at the map.
