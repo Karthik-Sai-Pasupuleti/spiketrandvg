@@ -239,6 +239,14 @@ def main() -> None:
     t2e.add_argument("--no-ilif", action="store_true",
                      help="keep binary LIF instead of integer I-LIF")
     t2e.add_argument("--freeze-event", action="store_true")
+    t2e.add_argument("--text-backbone", default="roberta",
+                     choices=["roberta", "spikelm"],
+                     help="roberta: ANN, frozen, 124.8M (default). spikelm: SpikeLM's "
+                          "spiking BERT with roberta weights transplanted by name -- "
+                          "takes the model from ~30%% to ~98%% spiking, but the "
+                          "transplant is NOT spike-pretrained")
+    t2e.add_argument("--spikelm-T", type=int, default=4,
+                     help="SpikeLM's own internal timesteps (independent of --T)")
     t2e.add_argument("--taps", nargs="+", default=["s8", "s16"],
                      help="which encoder strides become attention keys. Default s8+s16 "
                           "is 4800+1200 = 6000 keys at 480x640; s16 alone is 1200, which "
@@ -695,6 +703,7 @@ def main_t2e(args) -> None:
         text_model=args.text_model, img_size=tuple(args.size), T=args.T,
         taps=tuple(args.taps),
         depth=args.depth, n_slots=args.n_slots, ilif=not args.no_ilif,
+        text_backbone=args.text_backbone, spikelm_T=args.spikelm_T,
         condition_encoder=not args.no_condition, freeze_event=args.freeze_event,
         freeze_text=not args.train_text, text_unfreeze_last=args.text_unfreeze_last,
         pos_std=args.pos_std, attn_scale=args.attn_scale, qk_lif=args.qk_lif,
@@ -746,7 +755,8 @@ def main_t2e(args) -> None:
     print(f"conditioning {'OFF' if args.no_condition else 'ON'} "
           f"({model.events.modulated_stages}) | ilif {not args.no_ilif} | "
           f"event backbone {'FROZEN' if args.freeze_event else 'trainable'}")
-    print(f"loss = box + {args.slot_weight}*slotCE + {args.tag_weight}*tagCE")
+    print(f"text {args.text_backbone} | loss = box + {args.slot_weight}*slotCE "
+          f"+ {args.tag_weight}*tagCE")
     print(f"trainable {n_tr/1e6:.2f}M of {n_all/1e6:.1f}M  " +
           "  ".join(f"{k} {v/1e6:.2f}M" for k, v in tp.items()))
     print(f"{steps_per_epoch} steps/epoch, {total_steps} total\n", flush=True)

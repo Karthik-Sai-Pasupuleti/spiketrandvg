@@ -56,6 +56,7 @@ FORKS = {
     "e3dsnn": REPOS / "E-3DSNN",
     "cmsf": REPOS / "CMSF",
     "spiliformer": REPOS / "SpiLiFormer",
+    "spikelm": REPOS / "SpikeLM",
 }
 
 
@@ -497,8 +498,25 @@ def build_from_args(run_args: dict, device: str):
     backbone weight immediately after construction, so loading SpiLiFormer's ImageNet
     checkpoint first would be wasted work.
     """
-    from spiketrandvg.model import RefCOCOGrounding      # lazy: avoids a cycle
+    # lazy imports: model.py imports THIS module for the fork loaders
+    from spiketrandvg.model import RefCOCOGrounding, Talk2EventGrounding
     size = tuple(run_args["size"])
+    if run_args.get("task") == "talk2event":
+        # a Talk2Event run needs its own class -- building RefCOCOGrounding from its
+        # args.json silently produced an unrelated architecture before this branch
+        return Talk2EventGrounding(
+            event_ckpt=None,
+            event_backbone=run_args.get("event_backbone", "spiliformer_dvs"),
+            text_model=run_args.get("text_model", "roberta-base"),
+            img_size=size, T=run_args.get("T", 5), depth=run_args.get("depth", 2),
+            n_slots=run_args.get("n_slots", 1000),
+            ilif=not run_args.get("no_ilif", False),
+            condition_encoder=not run_args.get("no_condition", False),
+            freeze_event=run_args.get("freeze_event", False),
+            freeze_text=not run_args.get("train_text", False),
+            text_backbone=run_args.get("text_backbone", "roberta"),
+            spikelm_T=run_args.get("spikelm_T", 4),
+        ).to(device)
     return RefCOCOGrounding(
         rgb_ckpt=None, text_model=run_args.get("text_model", "roberta-base"),
         img_size=size, T=run_args.get("T", 4), rgb_T=run_args.get("rgb_T", 1),
@@ -545,11 +563,22 @@ def firing_rates(model, rgb, ids, mask) -> dict[str, float]:
 @torch.no_grad()
 def positional_ratio(model: RefCOCOGrounding) -> float | None:
     """RMS(vision.pos) / RMS(pre-position lateral output from the last forward call)."""
-    lat = model.vision.last_lateral_rms
+    # RefCOCOGrounding keeps its encoder on `.vision`; Talk2EventGrounding on `.events`
+    enc = getattr(model, "vision", None) or getattr(model, "events", None)
+    lat = getattr(enc, "last_lateral_rms", None)
     if lat is None or lat == 0:
         return None
-    pos_rms = model.vision.pos.detach().float().pow(2).mean().sqrt().item()
-    return pos_rms / lat
+    pos = getattr(enc, "pos", None)
+    if pos is None:
+        # Talk2Event holds one positional table per tap, on the model rather than the
+        # encoder; average their RMS so the ratio stays a single comparable number
+        tables = getattr(model, "pos", None)
+        if tables is None:
+            return None
+        vals = tables.values() if hasattr(tables, "values") else [tables]
+        pos_rms = sum(t.detach().float().pow(2).mean().sqrt().item() for t in vals) / len(list(vals))
+        return pos_rms / lat
+    return pos.detach().float().pow(2).mean().sqrt().item() / lat
 
 
 @torch.no_grad()
@@ -560,7 +589,19 @@ def attention_perplexity(model, rgb, ids, mask) -> dict[str, float]:
     so this always reflects exactly what the model itself computed -- no duplicated
     forward logic to drift out of sync.
     """
-    _, diag = model(rgb, ids, mask, return_diagnostics=True)
+    # the two models expose their attention maps differently: RefCOCOGrounding takes a
+    # `return_diagnostics` flag and returns a list; Talk2EventGrounding has its own
+    # `return_map` attribute and puts a single tensor in its output dict
+    if hasattr(model, "return_map"):
+        prev = model.return_map
+        model.return_map = True
+        try:
+            maps = [model(rgb, ids, mask)["attn"]]
+        finally:
+            model.return_map = prev
+        diag = {"attn_maps": maps}
+    else:
+        _, diag = model(rgb, ids, mask, return_diagnostics=True)
     out = {}
     m = mask.to(torch.float32).unsqueeze(-1)                    # (B,L,1)
     for i, attn in enumerate(diag["attn_maps"]):
@@ -568,21 +609,43 @@ def attention_perplexity(model, rgb, ids, mask) -> dict[str, float]:
         a = a.clamp_min(1e-12)
         entropy = -(a * a.log()).sum(-1)                        # (B,L)
         perplexity = entropy.exp()
+        # RefCOCOGrounding queries with the caption's L tokens, so padded positions must
+        # be masked out. Talk2EventGrounding queries with 4 attribute sub-queries, which
+        # have no padding and no correspondence to token positions -- masking there would
+        # index a (B,4) tensor with a (B,L) mask.
         real = m.squeeze(-1).bool()
-        out[f"block{i}"] = perplexity[real].mean().item()
+        if perplexity.shape[1] == real.shape[1]:
+            out[f"block{i}"] = perplexity[real].mean().item()
+        else:
+            out[f"block{i}"] = perplexity.mean().item()
     return out
 
+
+def _unpack(batch):
+    """First four tensors of a batch, whichever collate produced it.
+
+    RefCOCO's collate yields (rgb, ids, mask, boxes, captions, metas) and
+    Talk2Event's yields (cube, ids, mask, boxes, attr_labels, captions, recs).
+    The diagnostics only ever need the first four, so unpack positionally rather
+    than by arity -- otherwise every helper here needs two code paths.
+    """
+    return batch[0], batch[1], batch[2], batch[3]
 
 @torch.no_grad()
 def mode_gap(model, loader, device, amp_ctx) -> dict[str, float]:
     """mIoU on the same samples, train() vs eval(). See the module docstring."""
+    from spiketrandvg.model import cxcywh_to_xyxy_norm      # lazy: avoids a cycle
+
     def run(training: bool) -> float:
         model.train(training)
         ious = []
-        for rgb, ids, mask, gt, _c, _m in loader:
+        for batch in loader:
+            rgb, ids, mask, gt = _unpack(batch)
             rgb, ids, mask, gt = (t.to(device) for t in (rgb, ids, mask, gt))
             with amp_ctx():
-                pred = model(rgb, ids, mask)
+                out = model(rgb, ids, mask)
+            # RefCOCOGrounding returns the box tensor; Talk2EventGrounding a dict
+            pred = out["box"] if isinstance(out, dict) else out
             ious.append(box_iou(cxcywh_to_xyxy_norm(pred.float()),
                                 cxcywh_to_xyxy_norm(gt)).diagonal().cpu())
         return torch.cat(ious).mean().item()
@@ -605,7 +668,8 @@ def main() -> None:
                     help="samples for the train/eval mode-gap check")
     args = ap.parse_args()
 
-    from spiketrandvg.dataloader import RefCOCO, make_collate   # lazy: avoids a cycle
+    from spiketrandvg.dataloader import (RefCOCO, Talk2Event, make_collate,  # lazy
+                                         make_t2e_collate)
     from spiketrandvg.textencoder import build_tokenizer
     device = "cuda" if torch.cuda.is_available() else "cpu"
     run_dir = Path(args.run)
@@ -627,10 +691,15 @@ def main() -> None:
 
     tokenizer = build_tokenizer()
     size = tuple(run_args["size"])
-    ds = RefCOCO(run_args["dataset"], "train", size=size, augment=None,
-                limit=run_args.get("limit_train"))
-    dl = DataLoader(ds, batch_size=min(8, len(ds)), shuffle=True,
-                    collate_fn=make_collate(tokenizer))
+    if run_args.get("task") == "talk2event":
+        ds = Talk2Event("train", t_steps=run_args.get("T", 5),
+                        limit=run_args.get("limit_train"))
+        collate = make_t2e_collate(tokenizer)
+    else:
+        ds = RefCOCO(run_args["dataset"], "train", size=size, augment=None,
+                     limit=run_args.get("limit_train"))
+        collate = make_collate(tokenizer)
+    dl = DataLoader(ds, batch_size=min(8, len(ds)), shuffle=True, collate_fn=collate)
     amp_ctx = ((lambda: torch.autocast("cuda", dtype=torch.bfloat16))
                if device == "cuda" else __import__("contextlib").nullcontext)
 
@@ -642,10 +711,10 @@ def main() -> None:
     it = iter(dl)
     for _ in range(args.n_batches):
         try:
-            rgb, ids, mask, gt, _c, _m = next(it)
+            rgb, ids, mask, gt = _unpack(next(it))
         except StopIteration:
             it = iter(dl)
-            rgb, ids, mask, gt, _c, _m = next(it)
+            rgb, ids, mask, gt = _unpack(next(it))
         rgb, ids, mask = (t.to(device) for t in (rgb, ids, mask))
         with amp_ctx():
             rates = firing_rates(model, rgb, ids, mask)
@@ -667,14 +736,23 @@ def main() -> None:
     print(f"\n=== positional RMS ratio (RMS(pos) / RMS(pre-pos lateral output)) ===")
     ratio = positional_ratio(model)
     if ratio is None:
-        print("  unavailable (no forward call captured a lateral RMS)")
+        print("  unavailable -- the event encoder does not stash a lateral RMS; the "
+              "model reports pos_rms_ratio in its own final_metrics.json instead")
     else:
         flag = "  <-- position may be lost before the LIF threshold" if ratio < 0.05 else ""
         print(f"  {ratio:.4f}{flag}")
 
-    print(f"\n=== attention perplexity per block (n={n} batches, ~{model.vision.pos.shape[-2]}"
-          f"x{model.vision.pos.shape[-1]} = "
-          f"{model.vision.pos.shape[-2]*model.vision.pos.shape[-1]} keys) ===")
+    # key count differs per model: RefCOCOGrounding has one positional table, and
+    # Talk2EventGrounding has one per tap whose sizes sum to the total key count
+    enc = getattr(model, "vision", None) or getattr(model, "events", None)
+    pos = getattr(enc, "pos", None)
+    if pos is not None:
+        n_keys = pos.shape[-2] * pos.shape[-1]
+    else:
+        tables = getattr(model, "pos", {})
+        vals = tables.values() if hasattr(tables, "values") else []
+        n_keys = sum(t.shape[-2] * t.shape[-1] for t in vals)
+    print(f"\n=== attention perplexity per block (n={n} batches, {n_keys} keys) ===")
     print("    (near the key count = map is ~uniform, carries no location)")
     print("    (near 1 = map has collapsed onto a single position)")
     for k in sorted(perp_sums):
@@ -686,9 +764,22 @@ def main() -> None:
     from torch.utils.data import Subset
     n_gap = min(args.mode_gap_samples, len(ds))
     gap_idxs = list(range(0, len(ds), max(1, len(ds) // n_gap)))[:n_gap]
-    gap_dl = DataLoader(Subset(ds, gap_idxs), batch_size=8, shuffle=False,
-                        collate_fn=make_collate(tokenizer))
-    g = mode_gap(model, gap_dl, device, amp_ctx)
+    # batch 2, not 8: the Talk2Event model needs ~27 GiB at batch 4, and an oversized
+    # diagnostic batch is killed by the OOM reaper with no traceback (exit 1, silent)
+    # `collate` (task-aware, chosen above), NOT make_collate: RefCOCO's collate unpacks
+    # 4-tuples and Talk2Event's dataset yields 5, so hardcoding it failed with an
+    # unpacking error that surfaced only as a silent exit
+    gap_dl = DataLoader(Subset(ds, gap_idxs), batch_size=2, shuffle=False,
+                        collate_fn=collate)
+    # This section runs the model twice more, in train() mode, and is the most
+    # memory-hungry part of the script. A failure here must not cost the caller the
+    # firing rates and perplexity already printed above.
+    try:
+        g = mode_gap(model, gap_dl, device, amp_ctx)
+    except Exception as e:                      # noqa: BLE001 - diagnostics, report and continue
+        print(f"  unavailable: {type(e).__name__}: {e}")
+        print("  (retry with a smaller --mode-gap-samples, or read train_mIoU from log.tsv)")
+        return
     flag = "  <-- SUSPECT: fix the eval path before trusting other numbers" \
         if abs(g["gap"]) > 0.10 else ""
     print(f"  train() mIoU {g['train_mode_mIoU']:.4f}  eval() mIoU {g['eval_mode_mIoU']:.4f}"
@@ -736,3 +827,39 @@ def load_spiliformer_dvs() -> types.ModuleType:
     mod = _load_file("spili_dvs", FORKS["spiliformer"] / "cifar10dvs" / "model.py")
     _fix_spiliformer_square_assumption(mod)
     return mod
+
+
+@lru_cache(maxsize=1)
+def load_spikelm():
+    """SpikeLM's spiking BERT (`spike_bert.py`), loaded as `spikelm_bert`.
+
+    Contract verified against the source:
+      * `BertModel(config, add_pooling_layer=False)` takes a stock transformers
+        `BertConfig` carrying five extra attributes the spiking code reads:
+        weight_bits, quantize_act, clip_val, input_bits, T.
+      * `BertEncoder` owns the time axis itself: it repeats the embeddings to
+        (T, B, L, D) and averages back with `.mean(0)`, so `last_hidden_state` is
+        (B, L, hidden) and its T is independent of the vision encoder's.
+      * CUDA-ONLY: `SpikeLinear.forward` hard-codes `.cuda()`, so both the model
+        and its inputs must be on the GPU.
+      * Needs transformers < 5 (it imports `find_pruneable_heads_and_indices`).
+      * **No released weights.** SpikeLM is a quantisation-aware-training FRAMEWORK
+        for turning an ANN LLM into an SNN; the repository ships the recipe, not a
+        trained checkpoint. Any use here transplants roberta/BERT weights by name
+        into the spiking forward pass, which is not the same as a spike-pretrained
+        model, and is the single most important caveat on any result using it.
+
+    `spike_bert.py` does a bare `from spiking import ...`, so spiking.py is
+    registered under the plain name `spiking` for the duration of the import and
+    then removed, keeping that generic name out of the process afterwards.
+    """
+    d = FORKS["spikelm"] / "spikeLM-BERT"
+    spiking = _load_file("spikelm_spiking", d / "spiking.py")
+    had = "spiking" in sys.modules
+    if not had:
+        sys.modules["spiking"] = spiking
+    try:
+        return _load_file("spikelm_bert", d / "spike_bert.py")
+    finally:
+        if not had:
+            sys.modules.pop("spiking", None)

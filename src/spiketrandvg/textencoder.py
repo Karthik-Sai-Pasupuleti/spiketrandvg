@@ -29,7 +29,7 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 __all__ = ["MAX_TEXT_LEN", "TOKENIZER_NAME", "TextEncoder", "build_tokenizer",
-           "ATTRIBUTES", "AttributeQueryTagger"]
+           "ATTRIBUTES", "AttributeQueryTagger", "SpikingTextEncoder"]
 
 # Talk2Event annotates every caption with phrases under exactly these four headings.
 # They are the dataset's own labels, not a taxonomy invented here -- see
@@ -176,3 +176,91 @@ class AttributeQueryTagger(nn.Module):
         empty = (denom < 1e-4).to(tokens.dtype)                    # (B,n_attr,1)
         queries = pooled * (1 - empty) + self.null_query[None] * empty
         return queries, logits
+
+
+class SpikingTextEncoder(nn.Module):
+    """SpikeLM's spiking BERT + projection. Drop-in for `TextEncoder`.
+
+        forward(input_ids, attention_mask) -> (B, L, d_model)
+
+    Why this exists
+    ---------------
+    The rest of the model is spike-driven but the language half is a conventional ANN --
+    roberta-base is 124.8M of the 183.9M parameters, so by parameter count the system is
+    only ~30% spiking. That is the weakest point in any "spiking grounding" claim. This
+    swaps the one remaining ANN for a spiking encoder, taking the model to ~98% spiking.
+
+    What SpikeLM actually is, and the caveat that governs every result
+    ------------------------------------------------------------------
+    SpikeLM is a quantisation-aware-training FRAMEWORK for converting an ANN language
+    model into an SNN. The repository ships the recipe and the architecture; it ships
+    **no trained weights**. So `pretrained_name` here transplants roberta/BERT tensors by
+    NAME into the spiking forward pass -- 197 of 199 matched last time this was tried.
+    Those weights were trained for continuous activations and are being run through
+    binary ones. Nothing about this encoder is spike-pretrained, and a frozen transplant
+    should be expected to underperform its ANN source rather than match it.
+
+    Prior result, and why it is not decisive
+    -----------------------------------------
+    A frozen SpikeLM encoder previously measured caption delta **+0.0009 over 85 epochs**
+    -- caption-blind. That run is confounded: the architecture it sat in was caption-blind
+    with roberta too (+0.0009 frozen, +0.051 unfrozen), because the attention map was
+    uniform and position could not reach the head at all. The encoder was never the
+    isolated variable. Re-running it on the current architecture -- which grounds at
+    caption delta +0.302 on held-out test -- is the first measurement that actually
+    isolates the text encoder.
+
+    CUDA-only: `SpikeLinear.forward` hard-codes `.cuda()` in the fork.
+    """
+
+    def __init__(self, pretrained_name: str = TOKENIZER_NAME, d_model: int = 256,
+                 freeze: bool = False, T: int = 4, input_bits: int = 1,
+                 weight_bits: int = 1):
+        super().__init__()
+        from transformers import AutoConfig, AutoModel
+        from spiketrandvg import utils as forks
+
+        sl = forks.load_spikelm()
+        cfg = AutoConfig.from_pretrained(pretrained_name)
+        # the five extra attributes the spiking code reads off the config
+        cfg.weight_bits, cfg.input_bits = weight_bits, input_bits
+        cfg.quantize_act, cfg.clip_val, cfg.T = True, 2.5, T
+        self.encoder = sl.BertModel(cfg, add_pooling_layer=False)
+
+        # transplant the ANN weights by name -- see the caveat above
+        src = AutoModel.from_pretrained(pretrained_name).state_dict()
+        msg = self.encoder.load_state_dict(src, strict=False)
+        matched = len(src) - len(msg.unexpected_keys)
+        print(f"[textencoder] SpikeLM BERT from {pretrained_name}: {matched}/{len(src)} "
+              f"tensors transplanted (missing {len(msg.missing_keys)}, "
+              f"unexpected {len(msg.unexpected_keys)}) -- NOT spike-pretrained")
+        self.transplant_report = {"matched": matched, "of": len(src),
+                                  "missing": len(msg.missing_keys)}
+
+        self.proj = nn.Linear(cfg.hidden_size, d_model)
+        self.d_model, self.T = d_model, T
+        # `frozen` here means the same as in TextEncoder: no gradient through the encoder.
+        # Default is FALSE, unlike TextEncoder -- a transplant that was never trained in
+        # this regime has no pretraining worth protecting, and freezing it is what the
+        # previous +0.0009 result did.
+        self.frozen = freeze
+        self.partial = False
+        if freeze:
+            self.encoder.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.frozen:
+            self.encoder.eval()
+        return self
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        if input_ids.shape[1] > MAX_TEXT_LEN:
+            raise ValueError(f"caption length {input_ids.shape[1]} exceeds {MAX_TEXT_LEN}")
+        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        with ctx:
+            # BertEncoder owns its own time axis and averages it away internally, so
+            # last_hidden_state is (B, L, hidden) exactly as the ANN encoder returns
+            hidden = self.encoder(input_ids=input_ids,
+                                  attention_mask=attention_mask).last_hidden_state
+        return self.proj(hidden)

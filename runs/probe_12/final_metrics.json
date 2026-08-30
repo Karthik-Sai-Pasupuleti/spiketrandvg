@@ -1,0 +1,22 @@
+{
+ "n": 1140,
+ "mIoU": 0.311628133058548,
+ "Acc@0.25": 0.5675438642501831,
+ "Acc@0.5": 0.2526315748691559,
+ "Acc@0.75": 0.02631578966975212,
+ "Acc@0.9": 0.001754386001266539,
+ "attn_perplexity": 15.302374839782715,
+ "n_keys": 6000.0,
+ "pos_rms_ratio": 0.5,
+ "q_rate": 0.4665955901145935,
+ "k_rate": 0.400954931974411,
+ "logit_std": 3.781121253967285,
+ "prior_gain": 0.8322410583496094,
+ "box_mass": 0.4800684452056885,
+ "box_mass_x": 41.13196563720703,
+ "blind_mIoU": 0.09414897859096527,
+ "mIoU_on_hard_subset": 0.3043413460254669,
+ "caption_delta": 0.21019236743450165,
+ "n_hard": 773,
+ "_delta_note": "negatives are a caption for a DIFFERENT object in the SAME event frame; delta compares only the n_hard samples that have one"
+}

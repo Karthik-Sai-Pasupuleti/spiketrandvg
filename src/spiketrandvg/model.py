@@ -376,8 +376,11 @@ class RefCOCOGrounding(nn.Module):
             pos_std=pos_std,
         )
         self._disable_unused_backbone_grads()
+        # RefCOCOGrounding is the RGB control and always uses the ANN encoder; the
+        # spikelm option belongs to Talk2EventGrounding only.
         self.text = TextEncoder(text_model, d_model=d_model, freeze=freeze_text,
                                 unfreeze_last=text_unfreeze_last)
+        self.text_backbone = "roberta"
 
         # spike coders: both sides arrive analog, CMSF's blocks want spike trains
         with forks.allow_cupy_construction():
@@ -724,6 +727,8 @@ class Talk2EventGrounding(nn.Module):
         max_log_gain: float = 0.5,
         attn_bn_gain: float = 3.0,
         event_backbone: str = "spiliformer_dvs",
+        text_backbone: str = "roberta",
+        spikelm_T: int = 4,
         pos_std: float = 0.02,
         attn_scale: float | None = None,
         qk_lif: str = "ilif",
@@ -749,8 +754,19 @@ class Talk2EventGrounding(nn.Module):
         self.events = EventEncoder(ckpt_path=event_ckpt, taps=self.taps, in_channels=2,
                                    ilif=ilif, freeze=freeze_event,
                                    backbone=event_backbone, img_size=self.img_size)
-        self.text = TextEncoder(text_model, d_model=d_model, freeze=freeze_text,
-                                unfreeze_last=text_unfreeze_last)
+        if text_backbone == "spikelm":
+            # SpikeLM has no pretrained weights, so `freeze_text` is ignored here and
+            # the transplant is always trained -- freezing an untrained-in-regime
+            # transplant is what produced the prior +0.0009 caption-blind result.
+            from spiketrandvg.textencoder import SpikingTextEncoder
+            self.text = SpikingTextEncoder(text_model, d_model=d_model, freeze=False,
+                                           T=spikelm_T)
+        elif text_backbone == "roberta":
+            self.text = TextEncoder(text_model, d_model=d_model, freeze=freeze_text,
+                                    unfreeze_last=text_unfreeze_last)
+        else:
+            raise ValueError(f"unknown text_backbone {text_backbone!r}")
+        self.text_backbone = text_backbone
         self.tagger = AttributeQueryTagger(d_model=d_model, n_attr=self.n_attr)
 
         self.condition_encoder = condition_encoder

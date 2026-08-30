@@ -1,0 +1,15 @@
+{
+ "n": 2555,
+ "mIoU": 0.44416293501853943,
+ "Acc@0.25": 0.6567514538764954,
+ "Acc@0.5": 0.5076320767402649,
+ "Acc@0.75": 0.22622309625148773,
+ "Acc@0.9": 0.019178081303834915,
+ "blind_mIoU": 0.09764410555362701,
+ "mIoU_on_hard_subset": 0.39921900629997253,
+ "caption_delta": 0.3015749007463455,
+ "n_hard": 2106,
+ "_delta_note": "negatives are a caption for a DIFFERENT object in the SAME event frame; delta uses only the n_hard samples with one",
+ "_split": "talk2event/test",
+ "_ckpt": "runs/final_200/best.pth"
+}
